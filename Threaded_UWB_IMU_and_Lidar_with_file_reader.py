@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import numpy as np
 
-USE_LIVE_DATA = False
+USE_LIVE_DATA = True
 
 if USE_LIVE_DATA:
     from sense_hat import SenseHat

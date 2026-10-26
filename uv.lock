@@ -378,6 +378,19 @@ wheels = [
 ]
 
 [[package]]
+name = "sense-hat"
+version = "2.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pillow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/14/3a/23cfedbbad061e36d1441b66b23403cc4a5becd9c09348be7ef2bea37791/sense-hat-2.6.0.tar.gz", hash = "sha256:9fd1b3bb1bd98c51f3fe4099cd246884da0aa12c3acfc64c826be0153b9ae10e", size = 18585, upload-time = "2023-10-11T15:11:35.307Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f5/73/16d26aadb8f2635b7ce758491883eac8f44bb7d1ee4625afdc3143723f06/sense_hat-2.6.0-py3-none-any.whl", hash = "sha256:2934335c656a35026eb3a28e8ed129fb16265509b5e7b0b94930c039b1cb3472", size = 18148, upload-time = "2023-10-11T15:11:33.571Z" },
+]
+
+[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -403,6 +416,7 @@ dependencies = [
     { name = "common" },
     { name = "matplotlib" },
     { name = "pyserial" },
+    { name = "sense-hat" },
 ]
 
 [package.metadata]
@@ -410,4 +424,5 @@ requires-dist = [
     { name = "common", specifier = ">=0.1.2" },
     { name = "matplotlib", specifier = ">=3.11.2" },
     { name = "pyserial", specifier = ">=3.5" },
+    { name = "sense-hat", specifier = ">=2.6.0" },
 ]

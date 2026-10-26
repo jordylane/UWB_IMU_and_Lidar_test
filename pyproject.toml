@@ -8,4 +8,5 @@ dependencies = [
     "common>=0.1.2",
     "matplotlib>=3.11.2",
     "pyserial>=3.5",
+    "sense-hat>=2.6.0",
 ]
