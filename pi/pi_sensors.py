@@ -12,9 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common import PC_IP, SEND_RATE_HZ, UDP_PORT, encode_packet
+from common import PC_IP, SEND_RATE_HZ, UDP_PORT, anchors, encode_packet
 
 USE_LIVE_DATA = False
+PRINT_EVERY = 10
 
 if USE_LIVE_DATA:
     from sense_hat import SenseHat
@@ -413,15 +414,6 @@ def trilaterate_3d(anchors, distances):
     position = np.linalg.solve(A, b)
 
     return position
-
-
-# Example
-anchors = np.array([
-    [0.0, 0.0, 1.2],   # Anchor 1
-    [0.0, 4.0, 0.75],   # Anchor 2
-    [4.0, 4.0, 1.2],   # Anchor 3
-    [4.0, 0.0, 0.75]    # Anchor 4
-])
 
 
 # ----------------------------------------------------------------------
@@ -919,6 +911,7 @@ def attitude_loop():
 
 def sender_loop(pc_ip):
     interval = 1.0 / SEND_RATE_HZ
+    packet_count = 0
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
         while running:
@@ -939,11 +932,22 @@ def sender_loop(pc_ip):
                     "timestamp": time.time(),
                 }
 
-            
-            print("UDP running")
-            
+            payload = encode_packet(packet)
+            packet_count += 1
+            if packet_count % PRINT_EVERY == 0:
+                distances = ", ".join(f"{value:.2f}" for value in packet["distances"])
+                age = time.time() - packet["timestamp"]
+                print(
+                    f"#{packet_count} {len(payload)} B lidar={len(packet['lidar_x'])} "
+                    f"uwb=({packet['uwb_x']:.2f}, {packet['uwb_y']:.2f}) "
+                    f"distances=[{distances}] ax/ay=({packet['ax']:.3f}, "
+                    f"{packet['ay']:.3f}) heading={packet['heading']:.1f} "
+                    f"yaw={packet['yaw']:.1f} age={age:.3f}s",
+                    flush=True,
+                )
+
             try:
-                udp_socket.sendto(encode_packet(packet), (pc_ip, UDP_PORT))
+                udp_socket.sendto(payload, (pc_ip, UDP_PORT))
             except OSError:
                 pass
 

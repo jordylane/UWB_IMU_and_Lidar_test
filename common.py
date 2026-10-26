@@ -7,6 +7,12 @@ PC_IP = "192.168.1.100"
 UDP_PORT = 5005
 SEND_RATE_HZ = 20
 MAX_PACKET_SIZE = 60 * 1024
+anchors = np.array([
+    [0.0, 0.0, 1.2],
+    [0.0, 4.0, 0.75],
+    [4.0, 4.0, 1.2],
+    [4.0, 0.0, 0.75]
+])
 
 
 def _to_builtin(value):
