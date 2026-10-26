@@ -939,6 +939,9 @@ def sender_loop(pc_ip):
                     "timestamp": time.time(),
                 }
 
+            
+            print("UDP running")
+            
             try:
                 udp_socket.sendto(encode_packet(packet), (pc_ip, UDP_PORT))
             except OSError:
