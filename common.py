@@ -1,4 +1,6 @@
 import json
+import struct
+from collections.abc import Collection
 
 import numpy as np
 
@@ -9,6 +11,10 @@ UDP_PORT = 5005
 CONTROL_PORT = 5006
 SEND_RATE_HZ = 20
 CONTROL_RATE_HZ = 20
+TRACK_WIDTH = 0.35  # metres between the tank's tracks
+MAX_SPEED = 1.0  # metres per second at full track command
+CONTROL_PACKET_FORMAT = "!IdB"  # sequence, PC perf_counter timestamp, key bits
+CONTROL_KEY_BITS = {"up": 0x01, "down": 0x02, "left": 0x04, "right": 0x08}
 MAX_PACKET_SIZE = 60 * 1024
 anchors = np.array([
     [0.0, 0.0, 1.2],
@@ -16,6 +22,34 @@ anchors = np.array([
     [4.0, 4.0, 1.2],
     [4.0, 0.0, 0.75]
 ])
+
+
+def mix(keys: Collection[str]) -> tuple[float, float]:
+    """Mix held arrow keys into normalized left/right differential-track speeds."""
+    unknown_keys = set(keys) - CONTROL_KEY_BITS.keys()
+    if unknown_keys:
+        raise ValueError(f"Unknown control keys: {sorted(unknown_keys)}")
+
+    throttle = float("up" in keys) - float("down" in keys)
+    steering = float("right" in keys) - float("left" in keys)
+    left = throttle + steering
+    right = throttle - steering
+    scale = max(1.0, abs(left), abs(right))
+    return left / scale, right / scale
+
+
+def pack_control_packet(
+    sequence: int,
+    pc_timestamp: float,
+    keys: Collection[str],
+) -> bytes:
+    unknown_keys = set(keys) - CONTROL_KEY_BITS.keys()
+    if unknown_keys:
+        raise ValueError(f"Unknown control keys: {sorted(unknown_keys)}")
+    key_bits = 0
+    for key in keys:
+        key_bits |= CONTROL_KEY_BITS[key]
+    return struct.pack(CONTROL_PACKET_FORMAT, sequence, pc_timestamp, key_bits)
 
 
 def _to_builtin(value):

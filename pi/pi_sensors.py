@@ -13,7 +13,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common import PC_IP, SEND_RATE_HZ, UDP_PORT, anchors, encode_packet
+from common import (
+    CONTROL_PACKET_FORMAT,
+    CONTROL_PORT,
+    MAX_SPEED,
+    PC_IP,
+    SEND_RATE_HZ,
+    TRACK_WIDTH,
+    UDP_PORT,
+    anchors,
+    encode_packet,
+    mix,
+)
 from kalman import (
     HeadingKalmanFilter,
     MAG_EXPECTED_FIELD,
@@ -25,9 +36,110 @@ from kalman import (
 
 USE_LIVE_DATA = False
 PRINT_EVERY = 10
+CONTROL_TIMEOUT_SECONDS = 0.3
+MAX_SIMULATION_DT = 0.1
 
 if USE_LIVE_DATA:
     from sense_hat import SenseHat
+
+
+class ControlReceiver:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.latest_sequence = None
+        self.pc_timestamp = None
+        self.keys = set()
+        self.last_received = None
+        self.thread = threading.Thread(target=self._receive_loop, daemon=True)
+
+    @staticmethod
+    def _is_newer(sequence, previous):
+        difference = (sequence - previous) & 0xFFFFFFFF
+        return 0 < difference < 0x80000000
+
+    def _receive_loop(self):
+        packet_struct = struct.Struct(CONTROL_PACKET_FORMAT)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control_socket:
+            control_socket.bind(("", CONTROL_PORT))
+            control_socket.settimeout(0.05)
+            while not self.stop_event.is_set():
+                try:
+                    packet, _ = control_socket.recvfrom(packet_struct.size + 1)
+                except socket.timeout:
+                    continue
+                except OSError as exc:
+                    if not self.stop_event.is_set():
+                        print(f"control UDP receive failed: {exc}", flush=True)
+                    return
+
+                if len(packet) != packet_struct.size:
+                    continue
+                sequence, pc_timestamp, key_bits = packet_struct.unpack(packet)
+                if key_bits & ~0x0F or not math.isfinite(pc_timestamp):
+                    continue
+
+                with self.lock:
+                    if self.latest_sequence is not None and not self._is_newer(
+                        sequence, self.latest_sequence
+                    ):
+                        continue
+                    self.latest_sequence = sequence
+                    self.pc_timestamp = pc_timestamp
+                    self.keys = {
+                        key for key, bit in (
+                            ("up", 0x01),
+                            ("down", 0x02),
+                            ("left", 0x04),
+                            ("right", 0x08),
+                        )
+                        if key_bits & bit
+                    }
+                    self.last_received = time.perf_counter()
+
+    def current(self, now):
+        with self.lock:
+            if (
+                self.last_received is None
+                or now - self.last_received > CONTROL_TIMEOUT_SECONDS
+            ):
+                return set(), None, None
+            return self.keys.copy(), self.latest_sequence, self.pc_timestamp
+
+    def close(self):
+        self.stop_event.set()
+        self.thread.join()
+
+
+class VehicleSimulation:
+    def __init__(self):
+        self.x = 0.0
+        self.y = 0.0
+        self.heading = 0.0
+        self.last_update = None
+
+    def update(self, left_track, right_track, now):
+        dt = 0.0 if self.last_update is None else now - self.last_update
+        self.last_update = now
+        dt = min(max(dt, 0.0), MAX_SIMULATION_DT)
+
+        left_speed = left_track * MAX_SPEED
+        right_speed = right_track * MAX_SPEED
+        linear_speed = (left_speed + right_speed) / 2.0
+        angular_speed = (right_speed - left_speed) / TRACK_WIDTH
+        midpoint_heading = self.heading + angular_speed * dt / 2.0
+        self.x += linear_speed * math.cos(midpoint_heading) * dt
+        self.y += linear_speed * math.sin(midpoint_heading) * dt
+        self.heading = (self.heading + angular_speed * dt + math.pi) % (
+            2.0 * math.pi
+        ) - math.pi
+        return self.x, self.y, self.heading
+
+
+def apply_vehicle_command(vehicle, left_track, right_track, now):
+    """Simulation sink; replace this function's body with motor-driver output."""
+    return vehicle.update(left_track, right_track, now)
+
 
 # --------------------------------------------------
 # Data Sources
@@ -1022,13 +1134,24 @@ def attitude_loop():
 # UDP Sender Thread
 # --------------------------------------------------
 
-def sender_loop(pc_ip):
+def sender_loop(pc_ip, control_receiver=None, vehicle=None):
     interval = 1.0 / SEND_RATE_HZ
     packet_count = 0
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
         while running:
             send_start = time.perf_counter()
+            vehicle_x, vehicle_y, vehicle_heading = (0.0, 0.0, 0.0)
+            control_sequence = None
+            control_timestamp = None
+            if USE_LIVE_DATA and control_receiver is not None and vehicle is not None:
+                keys, control_sequence, control_timestamp = control_receiver.current(
+                    send_start
+                )
+                left_track, right_track = mix(keys)
+                vehicle_x, vehicle_y, vehicle_heading = apply_vehicle_command(
+                    vehicle, left_track, right_track, send_start
+                )
 
             with shared.lock:
                 packet = {
@@ -1045,6 +1168,11 @@ def sender_loop(pc_ip):
                     "gyro_heading": shared.gyro_heading,
                     "kalman_heading": shared.kalman_heading,
                     "yaw": shared.yaw,
+                    "vehicle_x": vehicle_x,
+                    "vehicle_y": vehicle_y,
+                    "vehicle_heading": vehicle_heading,
+                    "control_sequence": control_sequence,
+                    "control_timestamp": control_timestamp,
                     "timestamp": time.time(),
                 }
 
@@ -1081,13 +1209,20 @@ def main():
     parser.add_argument("--pc-ip", default=PC_IP, help="IP address of the PC display")
     args = parser.parse_args()
 
+    control_receiver = ControlReceiver() if USE_LIVE_DATA else None
+    vehicle = VehicleSimulation()
     threads = [
         threading.Thread(target=lidar_loop),
         threading.Thread(target=uwb_loop),
         threading.Thread(target=accelerometer_loop),
         threading.Thread(target=attitude_loop),
-        threading.Thread(target=sender_loop, args=(args.pc_ip,)),
+        threading.Thread(
+            target=sender_loop,
+            args=(args.pc_ip, control_receiver, vehicle),
+        ),
     ]
+    if control_receiver is not None:
+        threads.append(control_receiver.thread)
 
     for thread in threads:
         thread.start()
@@ -1097,6 +1232,8 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         running = False
+        if control_receiver is not None:
+            control_receiver.close()
         for thread in threads:
             thread.join()
         print("Stopped")

@@ -8,16 +8,141 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
 import numpy as np
+import tkinter as tk
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common import UDP_PORT, anchors, decode_packet
+from common import (
+    CONTROL_KEY_BITS,
+    CONTROL_PORT,
+    CONTROL_RATE_HZ,
+    PI_IP,
+    UDP_PORT,
+    anchors,
+    decode_packet,
+    pack_control_packet,
+)
 
 PLOT_MAX_RANGE = 4.0
 PLOT_AUTO_RANGE = False
 PLOT_CONFIDENCE = True
 PLOT_CONFIDENCE_COLOUR_MAP = "bwr_r"
 PRINT_EVERY = 10
+
+
+class ControlSender:
+    def __init__(self, pi_ip):
+        self.address = (pi_ip, CONTROL_PORT)
+        self.lock = threading.Lock()
+        self.keys = set()
+        self.pending_states = deque()
+        self.sent_timestamps = {}
+        self.wake = threading.Event()
+        self.closing = False
+        self.thread = threading.Thread(target=self._send_loop, daemon=True)
+        self.thread.start()
+
+    def set_keys(self, keys):
+        keys = set(keys)
+        with self.lock:
+            if self.closing:
+                return
+            if keys == self.keys:
+                return
+            self.keys = keys
+            self.pending_states.append(keys.copy())
+        self.wake.set()
+
+    def _send_loop(self):
+        interval = 1.0 / CONTROL_RATE_HZ
+        sequence = 0
+        next_send = time.perf_counter()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
+            udp_socket.setblocking(False)
+            while True:
+                timeout = max(0.0, next_send - time.perf_counter())
+                self.wake.wait(timeout)
+                self.wake.clear()
+
+                timestamp = time.perf_counter()
+                with self.lock:
+                    pending_states = list(self.pending_states)
+                    self.pending_states.clear()
+                    current_keys = self.keys.copy()
+                    closing = self.closing
+
+                states_to_send = pending_states
+                if timestamp >= next_send or (closing and not states_to_send):
+                    if not states_to_send or states_to_send[-1] != current_keys:
+                        states_to_send.append(current_keys)
+                    next_send = timestamp + interval
+                for keys in states_to_send:
+                    send_timestamp = time.perf_counter()
+                    with self.lock:
+                        self.sent_timestamps[sequence] = send_timestamp
+                        while len(self.sent_timestamps) > 256:
+                            oldest_sequence = next(iter(self.sent_timestamps))
+                            del self.sent_timestamps[oldest_sequence]
+                    packet = pack_control_packet(sequence, send_timestamp, keys)
+                    try:
+                        udp_socket.sendto(packet, self.address)
+                    except BlockingIOError:
+                        pass
+                    except OSError as exc:
+                        print(f"control UDP send failed: {exc}", flush=True)
+                    sequence = (sequence + 1) & 0xFFFFFFFF
+                if closing:
+                    break
+
+    def close(self):
+        with self.lock:
+            self.pending_states.append(set())
+            self.keys.clear()
+            self.closing = True
+        self.wake.set()
+        self.thread.join()
+
+    def round_trip_ms(self, sequence, echoed_timestamp):
+        if not isinstance(sequence, int) or not isinstance(echoed_timestamp, (int, float)):
+            return None
+        with self.lock:
+            sent_timestamp = self.sent_timestamps.get(sequence)
+        if sent_timestamp is None or sent_timestamp != echoed_timestamp:
+            return None
+        elapsed = time.perf_counter() - sent_timestamp
+        return elapsed * 1000.0 if elapsed >= 0.0 else None
+
+
+def bind_control_keys(fig, control_sender):
+    window = fig.canvas.manager.window
+    if not isinstance(window, tk.Misc):
+        raise RuntimeError(
+            "Arrow-key control requires Matplotlib's Tkinter backend."
+        )
+
+    held = set()
+
+    def on_key_press(event):
+        key = event.keysym.lower()
+        if key in CONTROL_KEY_BITS and key not in held:
+            held.add(key)
+            control_sender.set_keys(held)
+
+    def on_key_release(event):
+        key = event.keysym.lower()
+        if key in held:
+            held.remove(key)
+            control_sender.set_keys(held)
+
+    def on_focus_loss(_event):
+        if held:
+            held.clear()
+            control_sender.set_keys(held)
+
+    window.bind("<KeyPress>", on_key_press, add="+")
+    window.bind("<KeyRelease>", on_key_release, add="+")
+    window.bind("<FocusOut>", on_focus_loss, add="+")
+    window.focus_set()
 
 
 def display_heading(angle):
@@ -42,9 +167,13 @@ class DisplayData:
         self.gyro_heading = 0.0
         self.kalman_heading = 0.0
         self.yaw = 0.0
+        self.vehicle_x = 0.0
+        self.vehicle_y = 0.0
+        self.vehicle_heading = 0.0
+        self.rtt_ms = None
 
 
-def receiver_loop(shared_data, stop_event):
+def receiver_loop(shared_data, stop_event, control_sender):
     packet_count = 0
     failures = 0
     last_packet_time = time.monotonic()
@@ -70,6 +199,10 @@ def receiver_loop(shared_data, stop_event):
 
             try:
                 packet = decode_packet(payload)
+                round_trip_ms = control_sender.round_trip_ms(
+                    packet.get("control_sequence"),
+                    packet.get("control_timestamp"),
+                )
                 with shared_data.lock:
                     shared_data.lidar_x = packet["lidar_x"]
                     shared_data.lidar_y = packet["lidar_y"]
@@ -90,6 +223,10 @@ def receiver_loop(shared_data, stop_event):
                         "kalman_heading", shared_data.raw_heading
                     )
                     shared_data.yaw = packet["yaw"]
+                    shared_data.vehicle_x = packet.get("vehicle_x", 0.0)
+                    shared_data.vehicle_y = packet.get("vehicle_y", 0.0)
+                    if round_trip_ms is not None:
+                        shared_data.rtt_ms = round_trip_ms
                 if packet_count % PRINT_EVERY:
                     continue
                 distances = ", ".join(f"{value:.2f}" for value in packet["distances"])
@@ -108,13 +245,15 @@ def receiver_loop(shared_data, stop_event):
                     print(f"decode failure {failures}: {exc}", flush=True)
 
 
-def display_loop(shared_data, stop_event):
+def display_loop(shared_data, stop_event, control_sender):
     fig = plt.figure(figsize=(8, 8))
 
     ax_pos = fig.add_subplot(221)
 
     x_history = []
     y_history = []
+    vehicle_x_history = []
+    vehicle_y_history = []
 
     circle_1 = Circle(
         (anchors[0, 0], anchors[0, 1]),
@@ -158,6 +297,9 @@ def display_loop(shared_data, stop_event):
 
     graph_history = ax_pos.plot([], [], 'b-', label="Path")[0]
     graph_current = ax_pos.plot([], [], 'ro', label="Current Position")[0]
+    graph_vehicle = ax_pos.plot([], [], 'g-', label="Simulated vehicle")[0]
+    graph_vehicle_current = ax_pos.plot([], [], 'go', label="Sim vehicle")[0]
+    ax_pos.legend()
 
     ax_pos.set_xlim(0, 4.0)
     ax_pos.set_ylim(0, 4.0)
@@ -295,6 +437,7 @@ def display_loop(shared_data, stop_event):
 
     plt.ion()
     plt.show(block=False)
+    bind_control_keys(fig, control_sender)
     fig.canvas.mpl_connect("close_event", lambda event: stop_event.set())
 
     while not stop_event.is_set() and plt.fignum_exists(fig.number):
@@ -309,11 +452,16 @@ def display_loop(shared_data, stop_event):
             gyro_heading = shared_data.gyro_heading
             kalman_heading = shared_data.kalman_heading
             yaw = shared_data.yaw
+            vehicle_x = shared_data.vehicle_x
+            vehicle_y = shared_data.vehicle_y
+            rtt_ms = shared_data.rtt_ms
             ax_hist = np.asarray(shared_data.ax_buffer)
             ay_hist = np.asarray(shared_data.ay_buffer)
 
         x_history.append(uwb_x)
         y_history.append(uwb_y)
+        vehicle_x_history.append(vehicle_x)
+        vehicle_y_history.append(vehicle_y)
 
         raw_display_heading = display_heading(raw_heading)
         gyro_display_heading = display_heading(gyro_heading)
@@ -327,6 +475,8 @@ def display_loop(shared_data, stop_event):
         circle_4.set_radius(distances[3])
 
         graph_history.set_data(x_history, y_history)
+        graph_vehicle.set_data(vehicle_x_history, vehicle_y_history)
+        graph_vehicle_current.set_data([vehicle_x], [vehicle_y])
 
         if x_history and y_history:
             graph_current.set_data([x_history[-1]], [y_history[-1]])
@@ -396,6 +546,10 @@ def display_loop(shared_data, stop_event):
         yaw_text.set_text(
             f"Yaw = {np.degrees(yaw):.1f}°"
         )
+        fig.suptitle(
+            "Control RTT: -- ms" if rtt_ms is None
+            else f"Control RTT: {rtt_ms:.1f} ms"
+        )
 
         plt.pause(0.03)
 
@@ -403,19 +557,21 @@ def display_loop(shared_data, stop_event):
 def main():
     shared_data = DisplayData()
     stop_event = threading.Event()
+    control_sender = ControlSender(PI_IP)
     receiver = threading.Thread(
         target=receiver_loop,
-        args=(shared_data, stop_event),
+        args=(shared_data, stop_event, control_sender),
         daemon=True,
     )
     receiver.start()
 
     try:
-        display_loop(shared_data, stop_event)
+        display_loop(shared_data, stop_event, control_sender)
     except KeyboardInterrupt:
         pass
     finally:
         stop_event.set()
+        control_sender.close()
         plt.close("all")
         receiver.join()
 
