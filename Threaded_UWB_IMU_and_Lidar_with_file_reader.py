@@ -10,6 +10,8 @@ from matplotlib.patches import Circle
 import numpy as np
 from pynput import keyboard
 
+from common import PI_IP, CONTROL_RATE_HZ
+
 USE_LIVE_DATA = False
 
 if USE_LIVE_DATA:

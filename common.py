@@ -6,7 +6,9 @@ import numpy as np
 PC_IP = "192.168.1.115"
 PI_IP = "192.168.1.116"
 UDP_PORT = 5005
+CONTROL_PORT = 5006
 SEND_RATE_HZ = 20
+CONTROL_RATE_HZ = 20
 MAX_PACKET_SIZE = 60 * 1024
 anchors = np.array([
     [0.0, 0.0, 1.2],
