@@ -3,7 +3,8 @@ import json
 import numpy as np
 
 
-PC_IP = "192.168.1.100"
+PC_IP = "192.168.1.115"
+PI_IP = "192.168.1.116"
 UDP_PORT = 5005
 SEND_RATE_HZ = 20
 MAX_PACKET_SIZE = 60 * 1024
