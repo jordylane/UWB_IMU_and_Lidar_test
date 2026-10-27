@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import (
     CONTROL_PACKET_FORMAT,
     CONTROL_PORT,
+    CONTROL_TIMEOUT_SECONDS,
     MAX_SPEED,
     PC_IP,
     SEND_RATE_HZ,
@@ -24,6 +25,7 @@ from common import (
     anchors,
     encode_packet,
     mix,
+    unpack_control_packet,
 )
 from kalman import (
     HeadingKalmanFilter,
@@ -36,7 +38,6 @@ from kalman import (
 
 USE_LIVE_DATA = False
 PRINT_EVERY = 10
-CONTROL_TIMEOUT_SECONDS = 0.3
 MAX_SIMULATION_DT = 0.1
 
 if USE_LIVE_DATA:
@@ -59,13 +60,13 @@ class ControlReceiver:
         return 0 < difference < 0x80000000
 
     def _receive_loop(self):
-        packet_struct = struct.Struct(CONTROL_PACKET_FORMAT)
+        packet_size = struct.calcsize(CONTROL_PACKET_FORMAT)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control_socket:
             control_socket.bind(("", CONTROL_PORT))
             control_socket.settimeout(0.05)
             while not self.stop_event.is_set():
                 try:
-                    packet, _ = control_socket.recvfrom(packet_struct.size + 1)
+                    packet, _ = control_socket.recvfrom(packet_size + 1)
                 except socket.timeout:
                     continue
                 except OSError as exc:
@@ -73,10 +74,9 @@ class ControlReceiver:
                         print(f"control UDP receive failed: {exc}", flush=True)
                     return
 
-                if len(packet) != packet_struct.size:
-                    continue
-                sequence, pc_timestamp, key_bits = packet_struct.unpack(packet)
-                if key_bits & ~0x0F or not math.isfinite(pc_timestamp):
+                try:
+                    sequence, pc_timestamp, keys = unpack_control_packet(packet)
+                except ValueError:
                     continue
 
                 with self.lock:
@@ -86,15 +86,7 @@ class ControlReceiver:
                         continue
                     self.latest_sequence = sequence
                     self.pc_timestamp = pc_timestamp
-                    self.keys = {
-                        key for key, bit in (
-                            ("up", 0x01),
-                            ("down", 0x02),
-                            ("left", 0x04),
-                            ("right", 0x08),
-                        )
-                        if key_bits & bit
-                    }
+                    self.keys = keys
                     self.last_received = time.perf_counter()
 
     def current(self, now):

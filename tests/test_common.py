@@ -1,6 +1,11 @@
+import struct
 import unittest
 
-from common import mix
+from common import (
+    CONTROL_PACKET_FORMAT,
+    mix,
+    unpack_control_packet,
+)
 
 
 class MixTests(unittest.TestCase):
@@ -20,6 +25,19 @@ class MixTests(unittest.TestCase):
         for keys, expected in cases.items():
             with self.subTest(keys=keys):
                 self.assertEqual(mix(keys), expected)
+
+
+class ControlPacketTests(unittest.TestCase):
+    def test_unpack_control_packet(self):
+        packet = struct.pack(CONTROL_PACKET_FORMAT, 42, 12.5, 0x05)
+        self.assertEqual(
+            unpack_control_packet(packet),
+            (42, 12.5, {"up", "left"}),
+        )
+
+    def test_rejects_malformed_packet(self):
+        with self.assertRaises(ValueError):
+            unpack_control_packet(b"short")
 
 
 if __name__ == "__main__":
