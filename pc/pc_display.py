@@ -20,6 +20,12 @@ PLOT_CONFIDENCE_COLOUR_MAP = "bwr_r"
 PRINT_EVERY = 10
 
 
+def display_heading(angle):
+    hx = -np.sin(angle)
+    hy = np.cos(angle)
+    return (np.degrees(np.arctan2(hx, hy)) - 90 + 360) % 360
+
+
 class DisplayData:
     def __init__(self):
         self.lock = threading.Lock()
@@ -32,6 +38,9 @@ class DisplayData:
         self.ax_buffer = deque(maxlen=100)
         self.ay_buffer = deque(maxlen=100)
         self.heading = 0.0
+        self.raw_heading = 0.0
+        self.gyro_heading = 0.0
+        self.kalman_heading = 0.0
         self.yaw = 0.0
 
 
@@ -71,6 +80,15 @@ def receiver_loop(shared_data, stop_event):
                     shared_data.ax_buffer.append(packet["ax"])
                     shared_data.ay_buffer.append(packet["ay"])
                     shared_data.heading = packet["heading"]
+                    shared_data.raw_heading = packet.get(
+                        "raw_heading", np.radians(packet["heading"])
+                    )
+                    shared_data.gyro_heading = packet.get(
+                        "gyro_heading", shared_data.raw_heading
+                    )
+                    shared_data.kalman_heading = packet.get(
+                        "kalman_heading", shared_data.raw_heading
+                    )
                     shared_data.yaw = packet["yaw"]
                 if packet_count % PRINT_EVERY:
                     continue
@@ -191,15 +209,26 @@ def display_loop(shared_data, stop_event):
         [],
         [],
         'r',
-        linewidth=5
+        linewidth=2,
+        label="Raw mag"
     )[0]
 
     graph_compass_blue = ax_compass.plot(
         [],
         [],
         'b',
-        linewidth=3
+        linewidth=2,
+        label="Gyro only"
     )[0]
+
+    graph_compass_green = ax_compass.plot(
+        [],
+        [],
+        'g',
+        linewidth=4,
+        label="Kalman"
+    )[0]
+    ax_compass.legend(loc="lower center", ncol=3, fontsize=8)
 
     ax_compass.text(
         0, 1.12, 'N',
@@ -276,7 +305,9 @@ def display_loop(shared_data, stop_event):
             distances = shared_data.distances.copy()
             uwb_x = shared_data.uwb_x
             uwb_y = shared_data.uwb_y
-            heading = shared_data.heading
+            raw_heading = shared_data.raw_heading
+            gyro_heading = shared_data.gyro_heading
+            kalman_heading = shared_data.kalman_heading
             yaw = shared_data.yaw
             ax_hist = np.asarray(shared_data.ax_buffer)
             ay_hist = np.asarray(shared_data.ay_buffer)
@@ -284,12 +315,9 @@ def display_loop(shared_data, stop_event):
         x_history.append(uwb_x)
         y_history.append(uwb_y)
 
-        a = np.radians(heading)
-
-        hx = -np.sin(a)
-        hy = np.cos(a)
-
-        heading = (np.degrees(np.arctan2(hx, hy)) - 90 + 360) % 360
+        raw_display_heading = display_heading(raw_heading)
+        gyro_display_heading = display_heading(gyro_heading)
+        kalman_display_heading = display_heading(kalman_heading)
 
         yaw = (yaw - (np.pi / 2) + (2 * np.pi)) % (2 * np.pi)
 
@@ -321,20 +349,26 @@ def display_loop(shared_data, stop_event):
             ymax = max(ax_hist.max(), ay_hist.max()) + 0.25
             ax_accel.set_ylim(ymin, ymax)
 
-        a = np.radians(heading)
-
+        a = np.radians(raw_display_heading)
         graph_compass_red.set_data(
             [0, 0.8*np.sin(a)],
             [0, 0.8*np.cos(a)]
         )
 
+        a = np.radians(gyro_display_heading)
         graph_compass_blue.set_data(
             [0, -0.3*np.sin(a)],
             [0, -0.3*np.cos(a)]
         )
 
+        a = np.radians(kalman_display_heading)
+        graph_compass_green.set_data(
+            [0, np.sin(a)],
+            [0, np.cos(a)]
+        )
+
         ax_compass.set_title(
-            f"Compass Heading: {heading:.1f}°"
+            f"Compass Heading: {kalman_display_heading:.1f}°"
         )
 
         if PLOT_AUTO_RANGE and len(x) and len(y):

@@ -1,4 +1,5 @@
 import argparse
+import math
 import serial
 import threading
 import time
@@ -13,6 +14,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import PC_IP, SEND_RATE_HZ, UDP_PORT, anchors, encode_packet
+from kalman import (
+    HeadingKalmanFilter,
+    MAG_EXPECTED_FIELD,
+    MAX_PREDICT_DT,
+    accelerometer_roll_pitch,
+    tilt_compensated_heading,
+    wrap_angle,
+)
 
 USE_LIVE_DATA = False
 PRINT_EVERY = 10
@@ -193,7 +202,6 @@ class LiveAccSource:
     def __init__(self, record_filename=None):
 
         self.sense = SenseHat()
-
         self.record_file = None
 
         if record_filename:
@@ -258,37 +266,48 @@ class LiveAttSource:
     def __init__(self, record_filename=None):
 
         self.sense = SenseHat()
+        self.start_time = None
 
         self.record_file = None
 
         if record_filename:
             self.record_file = open(record_filename, "w")
+            self.record_file.write(
+                "raw_mag_heading_deg,roll_rad,pitch_rad,yaw_rad,elapsed_s,"
+                "mag_x_uT,mag_y_uT,mag_z_uT,accel_x_g,accel_y_g,accel_z_g,"
+                "gyro_z_rad_s,gyro_heading_deg,kalman_heading_deg,gyro_bias_deg_s\n"
+            )
 
-    def get_data(self, elapsed=0.0):
-
+    def get_data(self):
+        sample_timestamp = time.perf_counter()
+        if self.start_time is None:
+            self.start_time = sample_timestamp
+        accel = self.sense.get_accelerometer_raw()
+        gyro = self.sense.get_gyroscope_raw()
+        mag = self.sense.get_compass_raw()
         attitude = self.sense.get_orientation_radians()
 
-        roll = attitude["roll"]
-        pitch = attitude["pitch"]
-        yaw = attitude["yaw"]
+        return {
+            "mag_xyz": (mag["x"], mag["y"], mag["z"]),
+            "accel_xyz": (accel["x"], accel["y"], accel["z"]),
+            "gyro_z": gyro["z"],
+            "yaw": attitude["yaw"],
+            "elapsed": sample_timestamp - self.start_time,
+        }
 
-        mag = self.sense.get_compass_raw()
-
-        mx = mag["x"]
-        my = mag["y"]
-
-        heading = np.degrees(np.arctan2(my, mx))
-
-        if heading < 0:
-            heading += 360
-
+    def record(self, sample, roll, pitch, raw_heading, gyro_heading, kalman_heading, bias):
         if self.record_file:
+            mx, my, mz = sample["mag_xyz"]
+            ax, ay, az = sample["accel_xyz"]
             self.record_file.write(
-                f"{heading:.4f},{roll:.4f},{pitch:.4f},{yaw:.4f},{elapsed}\n"
+                f"{math.degrees(raw_heading):.4f},{roll:.6f},{pitch:.6f},"
+                f"{sample['yaw']:.6f},{sample['elapsed']:.6f},"
+                f"{mx:.5f},{my:.5f},{mz:.5f},{ax:.5f},{ay:.5f},{az:.5f},"
+                f"{sample['gyro_z']:.6f},{math.degrees(gyro_heading):.4f},"
+                f"{math.degrees(kalman_heading):.4f},"
+                f"{math.degrees(bias):.4f}\n"
             )
             self.record_file.flush()
-
-        return heading, roll, pitch, yaw, elapsed
     
 
     def close(self):
@@ -316,14 +335,40 @@ class FileAttSource:
             with shared.lock:
                 shared.att_file_looped = True
 
-        heading, roll, pitch, yaw, elapsed = map(
-            float,
-            line.strip().split(",")
-        )
+        if line.startswith("raw_mag_heading_deg,"):
+            line = self.file.readline()
+        if line == "":
+            raise ValueError(f"No attitude samples in {self.file.name}")
+
+        values = list(map(float, line.strip().split(",")))
+        if len(values) >= 15:
+            sample = {
+                "mag_xyz": tuple(values[5:8]),
+                "accel_xyz": tuple(values[8:11]),
+                "gyro_z": values[11],
+                "yaw": values[3],
+                "elapsed": values[4],
+            }
+        elif len(values) == 5:
+            heading, roll, pitch, yaw, elapsed = values
+            sample = {
+                "mag_xyz": None,
+                "accel_xyz": None,
+                "gyro_z": None,
+                "yaw": yaw,
+                "elapsed": elapsed,
+                "legacy_heading": math.radians(heading),
+                "legacy_roll": roll,
+                "legacy_pitch": pitch,
+            }
+        else:
+            raise ValueError(
+                f"Unrecognized attitude row in {self.file.name}: {line.strip()}"
+            )
 
         time.sleep(self.sample_period)
 
-        return heading, roll, pitch, yaw, elapsed
+        return sample
 
     def close(self):
 
@@ -339,6 +384,7 @@ class SharedData:
         
         self.ax_buffer = deque(maxlen=100)
         self.ay_buffer = deque(maxlen=100)
+        self.accel_xyz = (0.0, 0.0, 1.0)
 
         self.uwb_x = 0.0
         self.uwb_y = 0.0
@@ -349,6 +395,9 @@ class SharedData:
         self.distances = [0.0, 0.0, 0.0, 0.0]
         
         self.heading = 0.0
+        self.raw_heading = 0.0
+        self.gyro_heading = 0.0
+        self.kalman_heading = 0.0
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
@@ -799,6 +848,7 @@ def accelerometer_loop():
         with shared.lock:
             shared.ax_buffer.append(accel_x)
             shared.ay_buffer.append(accel_y)
+            shared.accel_xyz = (accel_x, accel_y, accel_z)
             lidar_elapsed = shared.lidar_elapsed_time
             shared.acc_elapsed_time = acc_elapsed
             
@@ -851,6 +901,10 @@ def attitude_loop():
     elapsed = 0.0
     prev_att_elapsed = 0.0
     att_elapsed_loop_offset = 0.0
+    previous_filter_timestamp = None
+    previous_yaw = None
+    gyro_heading = None
+    heading_filter = HeadingKalmanFilter()
     start_time = time.perf_counter()
     time_delay = 0.2
     
@@ -862,14 +916,13 @@ def attitude_loop():
 
     while running:
 
-        heading, roll, pitch, yaw, att_elapsed = att_source.get_data(elapsed)
+        sample = att_source.get_data()
+        yaw = sample["yaw"]
+        att_elapsed = sample["elapsed"]
 
         with shared.lock:
-            shared.heading = heading
-            shared.roll = roll
-            shared.pitch = pitch
-            shared.yaw = yaw
             lidar_elapsed = shared.lidar_elapsed_time
+            replay_accel_xyz = shared.accel_xyz
             shared.att_elapsed_time = att_elapsed
 
             if shared.att_file_looped:
@@ -878,7 +931,66 @@ def attitude_loop():
                 
         att_elapsed += att_elapsed_loop_offset
         prev_att_elapsed = att_elapsed
-        
+
+        dt = (
+            att_elapsed - previous_filter_timestamp
+            if previous_filter_timestamp is not None
+            else 0.0
+        )
+
+        if sample["accel_xyz"] is not None:
+            roll, pitch = accelerometer_roll_pitch(sample["accel_xyz"])
+        else:
+            roll, pitch = accelerometer_roll_pitch(replay_accel_xyz)
+
+        if sample["mag_xyz"] is not None:
+            raw_heading, field_magnitude = tilt_compensated_heading(
+                sample["mag_xyz"], roll, pitch
+            )
+        else:
+            raw_heading = sample["legacy_heading"]
+            field_magnitude = MAG_EXPECTED_FIELD
+
+        gyro_z = sample["gyro_z"]
+        if gyro_z is None:
+            gyro_z = (
+                wrap_angle(yaw - previous_yaw) / dt
+                if previous_yaw is not None and 0.0 < dt <= MAX_PREDICT_DT
+                else 0.0
+            )
+
+        previous_filter_timestamp = att_elapsed
+        previous_yaw = yaw
+
+        if gyro_heading is None:
+            gyro_heading = raw_heading
+        elif 0.0 < dt <= MAX_PREDICT_DT:
+            gyro_heading = wrap_angle(gyro_heading + gyro_z * dt)
+
+        heading_filter.predict(gyro_z, dt)
+        heading_filter.update(raw_heading, field_magnitude)
+        kalman_heading = heading_filter.heading
+
+        if USE_LIVE_DATA:
+            att_source.record(
+                sample,
+                roll,
+                pitch,
+                raw_heading,
+                gyro_heading,
+                kalman_heading,
+                heading_filter.gyro_bias,
+            )
+
+        with shared.lock:
+            shared.raw_heading = raw_heading
+            shared.gyro_heading = gyro_heading
+            shared.kalman_heading = kalman_heading
+            shared.heading = math.degrees(kalman_heading)
+            shared.roll = roll
+            shared.pitch = pitch
+            shared.yaw = yaw
+
         now = time.perf_counter()
         dt = now - start_time
         elapsed += dt
@@ -905,6 +1017,7 @@ def attitude_loop():
         else:
             time.sleep(time_delay)
 
+    att_source.close()
 # --------------------------------------------------
 # UDP Sender Thread
 # --------------------------------------------------
@@ -928,6 +1041,9 @@ def sender_loop(pc_ip):
                     "ax": shared.ax_buffer[-1] if shared.ax_buffer else 0.0,
                     "ay": shared.ay_buffer[-1] if shared.ay_buffer else 0.0,
                     "heading": shared.heading,
+                    "raw_heading": shared.raw_heading,
+                    "gyro_heading": shared.gyro_heading,
+                    "kalman_heading": shared.kalman_heading,
                     "yaw": shared.yaw,
                     "timestamp": time.time(),
                 }
