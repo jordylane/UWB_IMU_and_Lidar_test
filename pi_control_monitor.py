@@ -11,7 +11,7 @@ from common import (
 )
 
 HEARTBEAT_SECONDS = 1.0
-KEY_ORDER = ("up", "down", "left", "right")
+KEY_ORDER = ("up", "down", "left", "right", "g_up", "g_down")
 
 
 def print_status(start, sequence, keys, age_ms):
