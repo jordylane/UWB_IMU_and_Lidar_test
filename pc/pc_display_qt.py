@@ -3,6 +3,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 
@@ -12,7 +13,9 @@ from PySide6.QtCore import QPoint, Qt, QSize, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -25,8 +28,10 @@ from PySide6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import (
+    COMMAND_TIMEOUT_S,
     CONTROL_PORT,
     CONTROL_RATE_HZ,
+    EXPECTED_RATE_HZ,
     PI_IP,
     UDP_PORT,
     anchors,
@@ -37,6 +42,15 @@ from common import (
 PRINT_EVERY = 10
 PLOT_SPAN = 5.0
 HISTORY_LENGTH = 100
+AUTO_DISARM_ON_LINK_LOST = True
+LINK_THRESHOLDS = {
+    "packet_age": {"green": 0.2, "amber": 1.0},
+    "loss": {"green": 0.02, "amber": 0.10},
+    "rate_ratio": {"green": 0.90, "amber": 0.70},
+    "rssi_dbm": {"green": -60.0, "amber": -70.0},
+    "command_late_s": 1.0,
+    "hysteresis_s": 1.0,
+}
 CONTROL_KEYS = {
     b"L": "left",
     b"R": "right",
@@ -59,6 +73,188 @@ RED = "#ed4245"
 AMBER = "#f0b232"
 
 
+class LinkMonitor:
+    def __init__(self):
+        self.arrival_times = deque(maxlen=HISTORY_LENGTH)
+        self.sequence_history = deque(maxlen=HISTORY_LENGTH)
+        self.packet_count = 0
+        self.total_sequence_gaps = 0
+        self.last_packet_time = None
+        self.latest_sequence = None
+        self.latest_packet_has_sequence = False
+        self.rssi_dbm = None
+        self.cmd_age_s = None
+        self.failsafe = None
+        self.history = deque(maxlen=30)
+        self.last_history_sample = None
+        self.state = "waiting"
+        self.better_state = None
+        self.better_state_since = None
+
+    def record(self, packet, received_at):
+        self.packet_count += 1
+        self.last_packet_time = received_at
+        self.arrival_times.append(received_at)
+
+        seq = packet.get("seq")
+        self.latest_packet_has_sequence = (
+            isinstance(seq, int)
+            and not isinstance(seq, bool)
+            and 0 <= seq <= 0xFFFFFFFF
+        )
+        if self.latest_packet_has_sequence:
+            if self.latest_sequence is None:
+                self.latest_sequence = seq
+                self.sequence_history.append(seq)
+            else:
+                difference = (seq - self.latest_sequence) & 0xFFFFFFFF
+                if 0 < difference < 0x80000000:
+                    self.total_sequence_gaps += difference - 1
+                    self.latest_sequence = seq
+                    self.sequence_history.append(seq)
+
+        rssi_dbm = packet.get("rssi_dbm")
+        self.rssi_dbm = (
+            float(rssi_dbm)
+            if isinstance(rssi_dbm, (int, float))
+            and not isinstance(rssi_dbm, bool)
+            and math.isfinite(rssi_dbm)
+            else None
+        )
+        cmd_age_s = packet.get("cmd_age_s")
+        self.cmd_age_s = (
+            float(cmd_age_s)
+            if isinstance(cmd_age_s, (int, float))
+            and not isinstance(cmd_age_s, bool)
+            and math.isfinite(cmd_age_s)
+            and cmd_age_s >= 0
+            else None
+        )
+        failsafe = packet.get("failsafe")
+        self.failsafe = failsafe if isinstance(failsafe, bool) else None
+
+    def _rate(self, now):
+        recent = [
+            received_at
+            for received_at in self.arrival_times
+            if now - received_at <= 2.0
+        ]
+        if len(recent) >= 2 and recent[-1] > recent[0]:
+            return (len(recent) - 1) / (recent[-1] - recent[0])
+        if self.last_packet_time is not None and now - self.last_packet_time > 2.0:
+            return 0.0
+        return None
+
+    def _loss(self):
+        if not self.latest_packet_has_sequence or not self.sequence_history:
+            return None
+        sequences = list(self.sequence_history)
+        gaps = 0
+        expected = 0
+        for previous, sequence in zip(sequences, sequences[1:]):
+            difference = (sequence - previous) & 0xFFFFFFFF
+            if 0 < difference < 0x80000000:
+                gaps += difference - 1
+                expected += difference
+        return gaps / (expected + 1) if expected else 0.0
+
+    def _target_state(self, age, rate, loss, rssi_dbm):
+        severities = {"green": 0, "amber": 1, "red": 2}
+        measures = []
+
+        if age is not None:
+            thresholds = LINK_THRESHOLDS["packet_age"]
+            if age < thresholds["green"]:
+                measures.append("green")
+            elif age <= thresholds["amber"]:
+                measures.append("amber")
+            else:
+                measures.append("red")
+
+        if loss is not None:
+            thresholds = LINK_THRESHOLDS["loss"]
+            if loss < thresholds["green"]:
+                measures.append("green")
+            elif loss <= thresholds["amber"]:
+                measures.append("amber")
+            else:
+                measures.append("red")
+
+        if rate is not None:
+            ratio = rate / EXPECTED_RATE_HZ
+            thresholds = LINK_THRESHOLDS["rate_ratio"]
+            if ratio > thresholds["green"]:
+                measures.append("green")
+            elif ratio >= thresholds["amber"]:
+                measures.append("amber")
+            else:
+                measures.append("red")
+
+        if rssi_dbm is not None:
+            thresholds = LINK_THRESHOLDS["rssi_dbm"]
+            if rssi_dbm > thresholds["green"]:
+                measures.append("green")
+            else:
+                measures.append("amber")
+
+        return max(measures, key=severities.get) if measures else "green"
+
+    def snapshot(self, now):
+        age = (
+            max(0.0, now - self.last_packet_time)
+            if self.last_packet_time is not None
+            else None
+        )
+        rate = self._rate(now)
+        loss = self._loss()
+
+        if self.last_packet_time is None:
+            self.state = "waiting"
+            self.better_state = None
+            self.better_state_since = None
+        else:
+            target = self._target_state(age, rate, loss, self.rssi_dbm)
+            severity = {"green": 0, "amber": 1, "red": 2}
+            current_severity = severity.get(self.state, -1)
+            target_severity = severity[target]
+            if target_severity > current_severity:
+                self.state = target
+                self.better_state = None
+                self.better_state_since = None
+            elif target_severity < current_severity:
+                if target != self.better_state:
+                    self.better_state = target
+                    self.better_state_since = now
+                elif now - self.better_state_since >= LINK_THRESHOLDS["hysteresis_s"]:
+                    self.state = target
+                    self.better_state = None
+                    self.better_state_since = None
+            else:
+                self.better_state = None
+                self.better_state_since = None
+
+        if (
+            self.last_history_sample is None
+            or now - self.last_history_sample >= 1.0
+        ):
+            self.history.append((now, rate, loss))
+            self.last_history_sample = now
+
+        return {
+            "state": self.state,
+            "packet_count": self.packet_count,
+            "total_sequence_gaps": self.total_sequence_gaps,
+            "last_packet_age": age,
+            "rate_hz": rate,
+            "loss": loss,
+            "rssi_dbm": self.rssi_dbm,
+            "cmd_age_s": self.cmd_age_s,
+            "failsafe": self.failsafe,
+            "history": list(self.history),
+            "sampled_at": now,
+        }
+
+
 def display_heading(angle):
     hx = -np.sin(angle)
     hy = np.cos(angle)
@@ -72,6 +268,7 @@ def filter_position(x, y):
 class DisplayData:
     def __init__(self):
         self.lock = threading.Lock()
+        self.link_monitor = LinkMonitor()
         self.lidar_x = np.array([])
         self.lidar_y = np.array([])
         self.lidar_c = np.array([])
@@ -92,9 +289,7 @@ class DisplayData:
 
 
 def receiver_loop(shared_data, stop_event, udp_socket):
-    packet_count = 0
     failures = 0
-    last_packet_time = time.monotonic()
     warned = False
     print(f"listening on port {UDP_PORT}", flush=True)
 
@@ -102,7 +297,15 @@ def receiver_loop(shared_data, stop_event, udp_socket):
         try:
             payload, sender_address = udp_socket.recvfrom(65535)
         except socket.timeout:
-            if not warned and time.monotonic() - last_packet_time >= 5:
+            with shared_data.lock:
+                last_packet_time = shared_data.link_monitor.last_packet_time
+            if (
+                not warned
+                and (
+                    last_packet_time is None
+                    or time.monotonic() - last_packet_time >= 5
+                )
+            ):
                 print("no packets for 5 s", flush=True)
                 warned = True
             continue
@@ -111,12 +314,8 @@ def receiver_loop(shared_data, stop_event, udp_socket):
                 print(f"UDP receive failed: {exc}", flush=True)
             break
 
-        received_at = time.monotonic()
-        last_packet_time = received_at
-        warned = False
-        packet_count += 1
-
         try:
+            received_at = time.monotonic()
             packet = decode_packet(payload)
             lidar_x = np.asarray(packet["lidar_x"])
             lidar_y = np.asarray(packet["lidar_y"])
@@ -125,6 +324,7 @@ def receiver_loop(shared_data, stop_event, udp_socket):
             seq = packet.get("seq")
             rssi_dbm = packet.get("rssi_dbm")
             with shared_data.lock:
+                shared_data.link_monitor.record(packet, received_at)
                 shared_data.lidar_x = lidar_x
                 shared_data.lidar_y = lidar_y
                 shared_data.lidar_c = lidar_c
@@ -135,19 +335,25 @@ def receiver_loop(shared_data, stop_event, udp_socket):
                 shared_data.distances = distances
                 shared_data.heading = float(packet["heading"])
                 shared_data.yaw = float(packet["yaw"])
-                shared_data.seq = seq if isinstance(seq, int) else None
+                shared_data.seq = (
+                    seq
+                    if isinstance(seq, int) and not isinstance(seq, bool)
+                    else None
+                )
                 shared_data.rssi_dbm = (
                     float(rssi_dbm)
                     if isinstance(rssi_dbm, (int, float))
                     and math.isfinite(rssi_dbm)
                     else None
                 )
-                shared_data.packet_count = packet_count
+                shared_data.packet_count = shared_data.link_monitor.packet_count
                 shared_data.last_packet_time = received_at
                 shared_data.sender_address = sender_address
                 shared_data.arrival_times.append(received_at)
                 if shared_data.seq is not None:
                     shared_data.sequence_history.append(shared_data.seq)
+                packet_count = shared_data.link_monitor.packet_count
+            warned = False
 
             if packet_count % PRINT_EVERY:
                 continue
@@ -164,10 +370,11 @@ def receiver_loop(shared_data, stop_event, udp_socket):
                 f"yaw={packet['yaw']:.1f} age={age:.3f}s",
                 flush=True,
             )
-        except (KeyError, TypeError, ValueError, RecursionError) as exc:
+        except Exception:
             failures += 1
             if failures % 50 == 0:
-                print(f"decode failure {failures}: {exc}", flush=True)
+                print(f"decode failure {failures} traceback:", flush=True)
+                traceback.print_exc()
 
 
 class CompassWidget(QWidget):
@@ -352,7 +559,10 @@ class UwbPlot(SquarePlotWidget):
             symbolBrush=RED, symbolPen=pg.mkPen(RED)
         )
 
-    def update_data(self, distances, raw_x, raw_y, filtered_x, filtered_y, x, y):
+    def update_data(
+        self, distances, raw_x, raw_y, filtered_x, filtered_y, x, y,
+        show_current=True,
+    ):
         self.raw_path.setData(raw_x, raw_y)
         self.filtered_path.setData(filtered_x, filtered_y)
         angles = np.linspace(0, 2 * np.pi, 65)
@@ -364,7 +574,10 @@ class UwbPlot(SquarePlotWidget):
                 anchor_x + radius * np.cos(angles),
                 anchor_y + radius * np.sin(angles),
             )
-        self.current_position.setData([x], [y])
+        if show_current:
+            self.current_position.setData([x], [y])
+        else:
+            self.current_position.setData([], [])
 
 
 class CameraPlaceholder(QFrame):
@@ -387,6 +600,141 @@ class CameraPlaceholder(QFrame):
         return QSize(300, 300)
 
 
+class StaleOverlay(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("staleOverlay")
+        self.setStyleSheet(
+            "QWidget#staleOverlay { background-color: rgba(18, 19, 21, 210); }"
+            "QLabel { background: transparent; color: #dbdee1; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.message = QLabel("No data")
+        self.message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.message.setWordWrap(True)
+        layout.addWidget(self.message)
+        self.hide()
+
+    def set_age(self, age):
+        self.message.setText(f"No data, last update {age:.1f} s ago")
+
+
+class HealthPanel(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.stale_overlay = StaleOverlay(self)
+
+    def set_link_state(self, state, age):
+        if state == "red" and age is not None:
+            self.stale_overlay.set_age(age)
+            self.stale_overlay.setGeometry(self.rect())
+            self.stale_overlay.raise_()
+            self.stale_overlay.show()
+        else:
+            self.stale_overlay.hide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.stale_overlay.setGeometry(self.rect())
+
+
+class LinkDetailsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Link details")
+        self.setModal(False)
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        self.rate_plot = pg.PlotWidget()
+        self.rate_plot.setBackground(PANEL)
+        self.rate_plot.setTitle("Packet rate (Hz)")
+        self.rate_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.rate_plot.setLabel("bottom", "Seconds ago")
+        self.rate_plot.setXRange(-30, 0, padding=0)
+        self.rate_line = self.rate_plot.plot([], [], pen=pg.mkPen(BLUE, width=2))
+        layout.addWidget(self.rate_plot)
+
+        self.loss_plot = pg.PlotWidget()
+        self.loss_plot.setBackground(PANEL)
+        self.loss_plot.setTitle("Packet loss (%)")
+        self.loss_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.loss_plot.setLabel("bottom", "Seconds ago")
+        self.loss_plot.setLabel("left", "Loss", units="%")
+        self.loss_plot.setXRange(-30, 0, padding=0)
+        self.loss_plot.setYRange(0, 100, padding=0)
+        self.loss_line = self.loss_plot.plot(
+            [], [], pen=pg.mkPen(AMBER, width=2)
+        )
+        layout.addWidget(self.loss_plot)
+
+        self.details = {}
+        for name, title in (
+            ("packet_count", "Packets received"),
+            ("total_sequence_gaps", "Total sequence gaps"),
+            ("last_packet_age", "Last packet age"),
+            ("rssi_dbm", "RSSI"),
+            ("cmd_age_s", "Command age"),
+            ("failsafe", "Pi failsafe"),
+            ("pi_ip", "Pi IP"),
+            ("pc_ip", "PC IP"),
+        ):
+            row = QHBoxLayout()
+            label = QLabel(title)
+            value = QLabel("--")
+            value.setAlignment(Qt.AlignmentFlag.AlignRight)
+            row.addWidget(label)
+            row.addWidget(value)
+            layout.addLayout(row)
+            self.details[name] = value
+
+    def update_details(self, snapshot, pi_ip, pc_ip):
+        now = snapshot["sampled_at"]
+        history = snapshot["history"]
+        rate_points = [
+            (sample_time - now, rate)
+            for sample_time, rate, _loss in history
+            if rate is not None
+        ]
+        loss_points = [
+            (sample_time - now, loss * 100)
+            for sample_time, _rate, loss in history
+            if loss is not None
+        ]
+        self.rate_line.setData(
+            [point[0] for point in rate_points],
+            [point[1] for point in rate_points],
+        )
+        self.loss_line.setData(
+            [point[0] for point in loss_points],
+            [point[1] for point in loss_points],
+        )
+
+        age = snapshot["last_packet_age"]
+        rssi = snapshot["rssi_dbm"]
+        cmd_age = snapshot["cmd_age_s"]
+        self.details["packet_count"].setText(str(snapshot["packet_count"]))
+        self.details["total_sequence_gaps"].setText(
+            str(snapshot["total_sequence_gaps"])
+        )
+        self.details["last_packet_age"].setText(
+            f"{age:.2f} s" if age is not None else "--"
+        )
+        self.details["rssi_dbm"].setText(
+            f"{rssi:.0f} dBm" if rssi is not None else "--"
+        )
+        self.details["cmd_age_s"].setText(
+            f"{cmd_age:.2f} s" if cmd_age is not None else "--"
+        )
+        failsafe = snapshot["failsafe"]
+        self.details["failsafe"].setText(
+            "STOPPED" if failsafe is True else "Clear" if failsafe is False else "--"
+        )
+        self.details["pi_ip"].setText(pi_ip)
+        self.details["pc_ip"].setText(pc_ip)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -407,6 +755,9 @@ class MainWindow(QMainWindow):
         self.heading_degrees = 0.0
         self.yaw = 0.0
         self.pc_ip = self._get_local_ip()
+        self.displayed_link_state = "waiting"
+        self.original_title = "UWB / IMU / Lidar Dashboard"
+        self.health_panels = []
 
         self.receiver_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.receiver_socket.bind(("0.0.0.0", UDP_PORT))
@@ -414,6 +765,7 @@ class MainWindow(QMainWindow):
         self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         self._build_ui()
+        self.link_details = LinkDetailsDialog(self)
         self.receiver = threading.Thread(
             target=receiver_loop,
             args=(self.shared_data, self.stop_event, self.receiver_socket),
@@ -478,6 +830,7 @@ class MainWindow(QMainWindow):
         self.acceleration_plot.setBackground(PANEL)
         self.acceleration_plot.showGrid(x=True, y=True, alpha=0.25)
         self.acceleration_plot.setLabel("bottom", "Sample")
+        self.acceleration_plot.setYRange(-2, 2, padding=0)
         self.acceleration_plot.addLegend()
         self.acceleration_x_line = self.acceleration_plot.plot(
             [], [], pen=pg.mkPen(BLUE, width=1.5), name="x acceleration"
@@ -487,6 +840,32 @@ class MainWindow(QMainWindow):
         )
         acceleration_layout.addWidget(self.acceleration_plot, 1)
         top_bar.addWidget(acceleration_panel, 0)
+
+        controls_panel = QFrame()
+        controls_panel.setObjectName("panel")
+        controls_layout = QHBoxLayout(controls_panel)
+        controls_layout.setContentsMargins(8, 6, 8, 6)
+        controls_layout.setSpacing(12)
+        self.key_indicators = {}
+        self._add_keypad(
+            controls_layout,
+            "Grabber / claw",
+            (
+                (None, (b"w", "W"), None),
+                ((b"a", "A"), (b"s", "S"), (b"d", "D")),
+            ),
+            "actionKey",
+        )
+        self._add_keypad(
+            controls_layout,
+            "Movement",
+            (
+                (None, (b"U", "↑"), None),
+                ((b"L", "←"), (b"D", "↓"), (b"R", "→")),
+            ),
+            "arrowKey",
+        )
+        top_bar.addWidget(controls_panel, 0)
 
         top_bar.addStretch(1)
         status_block = QVBoxLayout()
@@ -501,10 +880,32 @@ class MainWindow(QMainWindow):
         shortcut_label = QLabel("Space to arm / disarm")
         shortcut_label.setObjectName("mutedText")
         status_block.addWidget(shortcut_label, 0, Qt.AlignmentFlag.AlignRight)
-        self.link_label = QLabel("Link: -- loss | -- Hz | -- dBm")
-        self.link_label.setObjectName("linkStatus")
-        self.link_label.setProperty("state", "muted")
-        status_block.addWidget(self.link_label, 0, Qt.AlignmentFlag.AlignRight)
+        link_status_row = QHBoxLayout()
+        link_status_row.setSpacing(6)
+        self.link_status_button = QPushButton()
+        self.link_status_button.setObjectName("linkStatusButton")
+        self.link_status_button.setFlat(True)
+        status_button_layout = QHBoxLayout(self.link_status_button)
+        status_button_layout.setContentsMargins(2, 0, 2, 0)
+        status_button_layout.setSpacing(5)
+        self.link_dot = QLabel()
+        self.link_dot.setObjectName("linkDot")
+        self.link_dot.setFixedSize(10, 10)
+        self.link_word = QLabel("Waiting for data")
+        self.link_word.setObjectName("linkWord")
+        status_button_layout.addWidget(self.link_dot)
+        status_button_layout.addWidget(self.link_word)
+        self.link_status_button.clicked.connect(self._show_link_details)
+        link_status_row.addWidget(self.link_status_button)
+        self.link_metric_label = QLabel("--")
+        self.link_metric_label.setObjectName("mutedText")
+        link_status_row.addWidget(self.link_metric_label)
+        status_block.addLayout(link_status_row)
+        self.command_health_label = QLabel("--")
+        self.command_health_label.setObjectName("mutedText")
+        status_block.addWidget(
+            self.command_health_label, 0, Qt.AlignmentFlag.AlignRight
+        )
         ip_label = QLabel(f"Pi: {PI_IP} | PC: {self.pc_ip}")
         ip_label.setObjectName("mutedText")
         status_block.addWidget(ip_label, 0, Qt.AlignmentFlag.AlignRight)
@@ -522,8 +923,9 @@ class MainWindow(QMainWindow):
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         bottom_layout.setSpacing(10)
 
-        lidar_panel = QFrame()
+        lidar_panel = HealthPanel()
         lidar_panel.setObjectName("panel")
+        self.health_panels.append(lidar_panel)
         lidar_panel.setMinimumSize(300, 300)
         lidar_layout = QVBoxLayout(lidar_panel)
         lidar_layout.setContentsMargins(10, 8, 10, 10)
@@ -535,8 +937,9 @@ class MainWindow(QMainWindow):
         lidar_layout.addWidget(self.lidar_plot, 1)
         bottom_layout.addWidget(lidar_panel, 1)
 
-        uwb_panel = QFrame()
+        uwb_panel = HealthPanel()
         uwb_panel.setObjectName("panel")
+        self.health_panels.append(uwb_panel)
         uwb_panel.setMinimumSize(300, 300)
         uwb_layout = QVBoxLayout(uwb_panel)
         uwb_layout.setContentsMargins(10, 8, 10, 10)
@@ -548,8 +951,9 @@ class MainWindow(QMainWindow):
         uwb_layout.addWidget(self.uwb_plot, 1)
         bottom_layout.addWidget(uwb_panel, 1)
 
-        camera_panel = QFrame()
+        camera_panel = HealthPanel()
         camera_panel.setObjectName("panel")
+        self.health_panels.append(camera_panel)
         camera_panel.setMinimumSize(300, 300)
         camera_layout = QVBoxLayout(camera_panel)
         camera_layout.setContentsMargins(10, 8, 10, 10)
@@ -571,6 +975,32 @@ class MainWindow(QMainWindow):
         status.addWidget(self.position_status)
         status.addWidget(self.anchor_status)
         status.addWidget(self.packet_status)
+
+    def _add_keypad(self, parent_layout, title, rows, key_style):
+        keypad = QVBoxLayout()
+        keypad.setSpacing(3)
+        title_label = QLabel(title)
+        title_label.setObjectName("controlGroupTitle")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        keypad.addWidget(title_label)
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(3)
+        for row_index, row in enumerate(rows):
+            for column_index, key_info in enumerate(row):
+                if key_info is None:
+                    continue
+                key, label_text = key_info
+                indicator = QLabel(label_text)
+                indicator.setObjectName("controlKey")
+                indicator.setProperty("keyStyle", key_style)
+                indicator.setProperty("pressed", "false")
+                indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                indicator.setFixedSize(30, 28)
+                self.key_indicators[key] = indicator
+                grid.addWidget(indicator, row_index, column_index)
+        keypad.addLayout(grid)
+        parent_layout.addLayout(keypad)
 
     def _set_armed(self, armed):
         self.arm_button.setText("ARMED" if armed else "DISARMED")
@@ -594,6 +1024,11 @@ class MainWindow(QMainWindow):
             for key in (b"L", b"R", b"U", b"D", b"w", b"s", b"d", b"a")
             if key in self.held
         )
+        for key, indicator in self.key_indicators.items():
+            pressed = key in self.held
+            indicator.setProperty("pressed", "true" if pressed else "false")
+            indicator.style().unpolish(indicator)
+            indicator.style().polish(indicator)
         if command == self.last_command:
             return
         self.last_command = command
@@ -623,54 +1058,131 @@ class MainWindow(QMainWindow):
             print(f"control UDP send failed: {exc}", flush=True)
         self.control_sequence = (self.control_sequence + 1) & 0xFFFFFFFF
 
-    def _sequence_loss(self, sequences):
-        if not sequences:
-            return None
-        lost = 0
-        expected = 0
-        previous = sequences[0]
-        for sequence in list(sequences)[1:]:
-            difference = (sequence - previous) & 0xFFFFFFFF
-            if 0 < difference < 0x80000000:
-                lost += difference - 1
-                expected += difference
-                previous = sequence
-        return lost / expected if expected else 0.0
+    def _show_link_details(self):
+        self.link_details.show()
+        self.link_details.raise_()
+        self.update_dashboard()
 
-    def _update_link_status(
-        self, last_packet_time, arrival_times, sequences, seq, rssi_dbm
-    ):
-        now = time.monotonic()
-        if last_packet_time is None or now - last_packet_time >= 1.0:
-            self.link_label.setText("LINK LOST")
-            self.link_label.setProperty("state", "red")
-            self.link_label.style().unpolish(self.link_label)
-            self.link_label.style().polish(self.link_label)
-            return
+    def _update_link_health(self, snapshot):
+        state = snapshot["state"]
+        state_labels = {
+            "waiting": "Waiting for data",
+            "green": "Connected",
+            "amber": "Degraded",
+            "red": "Link lost",
+        }
+        state_colors = {
+            "waiting": MUTED,
+            "green": GREEN,
+            "amber": AMBER,
+            "red": RED,
+        }
+        color = state_colors[state]
+        self.link_dot.setStyleSheet(
+            f"background-color: {color}; border-radius: 5px;"
+        )
+        self.link_word.setText(state_labels[state])
+        self.link_word.setStyleSheet(f"color: {color};")
 
-        loss = self._sequence_loss(sequences) if seq is not None else None
-        rate = (
-            (len(arrival_times) - 1) / (arrival_times[-1] - arrival_times[0])
-            if len(arrival_times) > 1 and arrival_times[-1] > arrival_times[0]
-            else None
-        )
-        loss_text = f"{loss * 100:.0f}%" if loss is not None else "--"
-        rate_text = f"{rate:.0f} Hz" if rate is not None else "-- Hz"
-        rssi_text = f"{rssi_dbm:.0f} dBm" if rssi_dbm is not None else "-- dBm"
-        self.link_label.setText(
-            f"Link: {loss_text} loss | {rate_text} | {rssi_text}"
-        )
-        if loss is None or rssi_dbm is None:
-            state = "muted"
-        elif loss < 0.02 and rssi_dbm > -60:
-            state = "green"
-        elif loss < 0.10 and rssi_dbm > -70:
-            state = "amber"
+        if state in ("green", "amber"):
+            loss = snapshot["loss"]
+            metric_text = f"{loss * 100:.1f}% loss" if loss is not None else "--"
+        elif state == "red":
+            age = snapshot["last_packet_age"]
+            metric_text = (
+                f"last packet {age:.1f} s ago" if age is not None else "--"
+            )
         else:
-            state = "red"
-        self.link_label.setProperty("state", state)
-        self.link_label.style().unpolish(self.link_label)
-        self.link_label.style().polish(self.link_label)
+            metric_text = "--"
+        self.link_metric_label.setText(metric_text)
+
+        cmd_age = snapshot["cmd_age_s"]
+        if snapshot["failsafe"] is True:
+            command_text = "Pi failsafe: STOPPED"
+            command_color = RED
+        elif cmd_age is None:
+            command_text = "--"
+            command_color = MUTED
+        elif cmd_age < COMMAND_TIMEOUT_S or (
+            (not self.arm_button.isChecked() or not self.held)
+            and not snapshot["failsafe"]
+        ):
+            command_text = "Commands OK"
+            command_color = GREEN
+        elif (
+            self.arm_button.isChecked()
+            and self.held
+            and cmd_age > LINK_THRESHOLDS["command_late_s"]
+        ):
+            command_text = "Commands not reaching Pi"
+            command_color = AMBER
+        else:
+            command_text = "Commands delayed"
+            command_color = AMBER
+        self.command_health_label.setText(command_text)
+        self.command_health_label.setStyleSheet(f"color: {command_color};")
+
+        for panel in self.health_panels:
+            panel.set_link_state(state, snapshot["last_packet_age"])
+
+        if state == "red":
+            self.setWindowTitle("LINK LOST: Rescue vehicle control")
+        else:
+            self.setWindowTitle(self.original_title)
+
+        previous = self.displayed_link_state
+        if state != previous:
+            age = snapshot["last_packet_age"]
+            loss = snapshot["loss"]
+            rate = snapshot["rate_hz"]
+            rssi = snapshot["rssi_dbm"]
+            if (
+                state == "red"
+                and age is not None
+                and age > LINK_THRESHOLDS["packet_age"]["amber"]
+            ):
+                reason = f"last packet {age:.1f} s ago"
+            elif (
+                state == "red"
+                and loss is not None
+                and loss > LINK_THRESHOLDS["loss"]["amber"]
+            ):
+                reason = f"loss {loss * 100:.1f}%"
+            elif (
+                state == "red"
+                and rate is not None
+                and rate / EXPECTED_RATE_HZ
+                < LINK_THRESHOLDS["rate_ratio"]["amber"]
+            ):
+                reason = f"rate {rate:.1f} Hz"
+            elif age is not None and age >= LINK_THRESHOLDS["packet_age"]["green"]:
+                reason = f"last packet {age:.1f} s ago"
+            elif loss is not None and loss >= LINK_THRESHOLDS["loss"]["green"]:
+                reason = f"loss {loss * 100:.1f}%"
+            elif rate is not None and (
+                rate / EXPECTED_RATE_HZ
+                <= LINK_THRESHOLDS["rate_ratio"]["green"]
+            ):
+                reason = f"rate {rate:.1f} Hz"
+            elif rssi is not None and (
+                rssi <= LINK_THRESHOLDS["rssi_dbm"]["green"]
+            ):
+                reason = f"RSSI {rssi:.0f} dBm"
+            else:
+                reason = "measurements healthy"
+            print(f"link: {previous} -> {state} ({reason})", flush=True)
+            self.displayed_link_state = state
+            if (
+                state == "red"
+                and previous != "red"
+                and AUTO_DISARM_ON_LINK_LOST
+                and self.arm_button.isChecked()
+            ):
+                self.arm_button.setChecked(False)
+                print("AUTO-DISARMED: link lost", flush=True)
+
+        if self.link_details.isVisible():
+            self.link_details.update_details(snapshot, PI_IP, self.pc_ip)
 
     def _fit_square_plots(self):
         for plot in (self.lidar_plot, self.uwb_plot):
@@ -685,7 +1197,9 @@ class MainWindow(QMainWindow):
 
     def update_dashboard(self):
         self._fit_square_plots()
+        now = time.monotonic()
         with self.shared_data.lock:
+            snapshot = self.shared_data.link_monitor.snapshot(now)
             lidar_x = self.shared_data.lidar_x.copy()
             lidar_y = self.shared_data.lidar_y.copy()
             lidar_c = self.shared_data.lidar_c.copy()
@@ -696,25 +1210,19 @@ class MainWindow(QMainWindow):
             uwb_y = self.shared_data.uwb_y
             heading = self.shared_data.heading
             raw_yaw = self.shared_data.yaw
-            packet_count = self.shared_data.packet_count
-            last_packet_time = self.shared_data.last_packet_time
-            arrival_times = list(self.shared_data.arrival_times)
-            sequences = list(self.shared_data.sequence_history)
-            seq = self.shared_data.seq
-            rssi_dbm = self.shared_data.rssi_dbm
             sender_address = self.shared_data.sender_address
 
-        self._update_link_status(
-            last_packet_time, arrival_times, sequences, seq, rssi_dbm
-        )
-        if last_packet_time is None:
+        self._update_link_health(snapshot)
+        if snapshot["last_packet_age"] is None:
             return
 
-        self.raw_x.append(uwb_x)
-        self.raw_y.append(uwb_y)
-        filtered_x, filtered_y = filter_position(uwb_x, uwb_y)
-        self.filtered_x.append(filtered_x)
-        self.filtered_y.append(filtered_y)
+        link_lost = snapshot["state"] == "red"
+        if not link_lost:
+            self.raw_x.append(uwb_x)
+            self.raw_y.append(uwb_y)
+            filtered_x, filtered_y = filter_position(uwb_x, uwb_y)
+            self.filtered_x.append(filtered_x)
+            self.filtered_y.append(filtered_y)
         self.latest_x = uwb_x
         self.latest_y = uwb_y
         self.heading_degrees = display_heading(math.radians(heading))
@@ -729,15 +1237,6 @@ class MainWindow(QMainWindow):
         sample_count = max(len(ax_buffer), len(ay_buffer))
         if sample_count:
             self.acceleration_plot.setXRange(0, sample_count, padding=0)
-            y_min = min(
-                min(ax_buffer) if ax_buffer else float("inf"),
-                min(ay_buffer) if ay_buffer else float("inf"),
-            ) - 0.25
-            y_max = max(
-                max(ax_buffer) if ax_buffer else float("-inf"),
-                max(ay_buffer) if ay_buffer else float("-inf"),
-            ) + 0.25
-            self.acceleration_plot.setYRange(y_min, y_max, padding=0)
 
         self.compass.set_heading(self.heading_degrees)
         self.heading_label.setText(f"Heading {self.heading_degrees:.1f}°")
@@ -755,9 +1254,10 @@ class MainWindow(QMainWindow):
             self.filtered_y,
             uwb_x,
             uwb_y,
+            show_current=not link_lost,
         )
         self.position_status.setText(f"UWB: {uwb_x:.2f}, {uwb_y:.2f} m")
-        self.packet_status.setText(f"Packets: {packet_count}")
+        self.packet_status.setText(f"Packets: {snapshot['packet_count']}")
         if sender_address is not None:
             self.sender_label.setText(
                 f"Receiving from {sender_address[0]}:{sender_address[1]}"
@@ -852,10 +1352,34 @@ def main():
         QLabel#panelTitle {{
             font-size: 11px;
         }}
-        QLabel#linkStatus[state="green"] {{ color: {GREEN}; }}
-        QLabel#linkStatus[state="amber"] {{ color: {AMBER}; }}
-        QLabel#linkStatus[state="red"] {{ color: {RED}; }}
-        QLabel#linkStatus[state="muted"] {{ color: {MUTED}; }}
+        QLabel#controlGroupTitle {{
+            color: {MUTED};
+            font-size: 10px;
+        }}
+        QLabel#controlKey {{
+            background: {PANEL};
+            border: 1px solid {BORDER};
+            border-radius: 4px;
+            color: {MUTED};
+            font-size: 14px;
+            font-weight: bold;
+        }}
+        QLabel#controlKey[keyStyle="arrowKey"][pressed="true"] {{
+            background: {BLUE};
+            border-color: {BLUE};
+            color: {WINDOW};
+        }}
+        QLabel#controlKey[keyStyle="actionKey"][pressed="true"] {{
+            background: {AMBER};
+            border-color: {AMBER};
+            color: {WINDOW};
+        }}
+        QPushButton#linkStatusButton {{
+            background: transparent;
+            border: none;
+            padding: 1px;
+        }}
+        QPushButton#linkStatusButton:hover {{ background: {BORDER}; }}
         QPushButton#armButton {{
             background: #4a4d54;
             border: 1px solid {BORDER};

@@ -14,9 +14,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import (
-    CONTROL_PACKET_FORMAT,
     CONTROL_PORT,
     CONTROL_TIMEOUT_SECONDS,
+    COMMAND_TIMEOUT_S,
     MAX_SPEED,
     PC_IP,
     SEND_RATE_HZ,
@@ -40,18 +40,35 @@ USE_LIVE_DATA = False
 PRINT_EVERY = 10
 MAX_SIMULATION_DT = 0.1
 
+
+def read_wifi_rssi_dbm():
+    try:
+        with open("/proc/net/wireless", "r") as wireless_file:
+            for line in wireless_file:
+                interface, separator, stats = line.partition(":")
+                if separator and interface.strip() == "wlan0":
+                    fields = stats.split()
+                    return int(round(float(fields[2].rstrip("."))))
+    except Exception:
+        return None
+    return None
+
+
 if USE_LIVE_DATA:
     from sense_hat import SenseHat
 
 
 class ControlReceiver:
-    def __init__(self):
+    def __init__(self, shared_data):
+        self.shared_data = shared_data
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.latest_sequence = None
         self.pc_timestamp = None
         self.keys = set()
         self.last_received = None
+        self.reported_stick_x = 0.0
+        self.reported_stick_y = 0.0
         self.thread = threading.Thread(target=self._receive_loop, daemon=True)
 
     @staticmethod
@@ -59,35 +76,112 @@ class ControlReceiver:
         difference = (sequence - previous) & 0xFFFFFFFF
         return 0 < difference < 0x80000000
 
+    @staticmethod
+    def _parse_joystick_packet(packet):
+        try:
+            fields = packet.decode("ascii").split(",")
+            if len(fields) != 3 or fields[0] != "J":
+                return None
+            x, y = float(fields[1]), float(fields[2])
+            if not math.isfinite(x) or not math.isfinite(y):
+                return None
+        except (UnicodeDecodeError, ValueError):
+            return None
+        return round(max(-1.0, min(1.0, x)), 2), round(
+            max(-1.0, min(1.0, y)), 2
+        )
+
+    def _report_stick_change(self, stick_x, stick_y):
+        if (
+            abs(stick_x - self.reported_stick_x) > 0.05
+            or abs(stick_y - self.reported_stick_y) > 0.05
+        ):
+            print(f"stick: x={stick_x:.2f} y={stick_y:.2f}", flush=True)
+            self.reported_stick_x = stick_x
+            self.reported_stick_y = stick_y
+
     def _receive_loop(self):
-        packet_size = struct.calcsize(CONTROL_PACKET_FORMAT)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control_socket:
             control_socket.bind(("", CONTROL_PORT))
             control_socket.settimeout(0.05)
             while not self.stop_event.is_set():
+                packet = None
                 try:
-                    packet, _ = control_socket.recvfrom(packet_size + 1)
+                    packet, _ = control_socket.recvfrom(65535)
                 except socket.timeout:
-                    continue
+                    pass
                 except OSError as exc:
                     if not self.stop_event.is_set():
                         print(f"control UDP receive failed: {exc}", flush=True)
                     return
 
-                try:
-                    sequence, pc_timestamp, keys = unpack_control_packet(packet)
-                except ValueError:
-                    continue
+                if packet is not None:
+                    joystick_values = (
+                        self._parse_joystick_packet(packet)
+                        if packet.startswith(b"J,")
+                        else None
+                    )
+                    is_joystick_packet = packet.startswith(b"J,")
+                    valid_command = False
+                    previous_failsafe = False
 
-                with self.lock:
-                    if self.latest_sequence is not None and not self._is_newer(
-                        sequence, self.latest_sequence
+                    if is_joystick_packet:
+                        if joystick_values is not None:
+                            with self.shared_data.lock:
+                                previous_failsafe = self.shared_data.failsafe
+                                self.shared_data.last_cmd_time = time.monotonic()
+                                self.shared_data.command_received = True
+                                self.shared_data.failsafe = False
+                                self.shared_data.stick_x = joystick_values[0]
+                                self.shared_data.stick_y = joystick_values[1]
+                            valid_command = True
+                            self._report_stick_change(*joystick_values)
+                    else:
+                        try:
+                            sequence, pc_timestamp, keys = unpack_control_packet(
+                                packet
+                            )
+                        except ValueError:
+                            pass
+                        else:
+                            with self.shared_data.lock:
+                                previous_failsafe = self.shared_data.failsafe
+                                self.shared_data.last_cmd_time = time.monotonic()
+                                self.shared_data.command_received = True
+                                self.shared_data.failsafe = False
+                            valid_command = True
+
+                            with self.lock:
+                                if self.latest_sequence is None or self._is_newer(
+                                    sequence, self.latest_sequence
+                                ):
+                                    self.latest_sequence = sequence
+                                    self.pc_timestamp = pc_timestamp
+                                    self.keys = keys
+                                    self.last_received = time.perf_counter()
+
+                    if valid_command and previous_failsafe:
+                        print("command resumed", flush=True)
+
+                now = time.monotonic()
+                with self.shared_data.lock:
+                    command_time = self.shared_data.last_cmd_time
+                    if (
+                        command_time is not None
+                        and now - command_time > COMMAND_TIMEOUT_S
+                        and not self.shared_data.failsafe
                     ):
-                        continue
-                    self.latest_sequence = sequence
-                    self.pc_timestamp = pc_timestamp
-                    self.keys = keys
-                    self.last_received = time.perf_counter()
+                        self.shared_data.stick_x = 0.0
+                        self.shared_data.stick_y = 0.0
+                        self.shared_data.failsafe = True
+                        stopped = True
+                        stick_x = self.shared_data.stick_x
+                        stick_y = self.shared_data.stick_y
+                    else:
+                        stopped = False
+                if stopped:
+                    print("failsafe: stopped", flush=True)
+                    self._report_stick_change(stick_x, stick_y)
 
     def current(self, now):
         with self.lock:
@@ -485,6 +579,11 @@ class FileAttSource:
 class SharedData:
     def __init__(self):
         self.lock = threading.Lock()
+        self.stick_x = 0.0
+        self.stick_y = 0.0
+        self.last_cmd_time = None
+        self.command_received = False
+        self.failsafe = False
         
         self.ax_buffer = deque(maxlen=100)
         self.ay_buffer = deque(maxlen=100)
@@ -1129,10 +1228,17 @@ def attitude_loop():
 def sender_loop(pc_ip, control_receiver=None, vehicle=None):
     interval = 1.0 / SEND_RATE_HZ
     packet_count = 0
+    sequence = 0
+    last_rssi_read = None
+    rssi_dbm = None
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
         while running:
             send_start = time.perf_counter()
+            now = time.monotonic()
+            if last_rssi_read is None or now - last_rssi_read >= 1.0:
+                rssi_dbm = read_wifi_rssi_dbm()
+                last_rssi_read = now
             vehicle_x, vehicle_y, vehicle_heading = (0.0, 0.0, 0.0)
             control_sequence = None
             control_timestamp = None
@@ -1146,7 +1252,18 @@ def sender_loop(pc_ip, control_receiver=None, vehicle=None):
                 )
 
             with shared.lock:
+                cmd_age_s = (
+                    time.monotonic() - shared.last_cmd_time
+                    if control_receiver is not None and shared.command_received
+                    else None
+                )
                 packet = {
+                    "seq": sequence,
+                    "rssi_dbm": rssi_dbm,
+                    "cmd_age_s": cmd_age_s,
+                    "failsafe": (
+                        shared.failsafe if control_receiver is not None else False
+                    ),
                     "lidar_x": shared.x.copy(),
                     "lidar_y": shared.y.copy(),
                     "lidar_c": shared.c.copy(),
@@ -1170,6 +1287,7 @@ def sender_loop(pc_ip, control_receiver=None, vehicle=None):
 
             payload = encode_packet(packet)
             packet_count += 1
+            sequence = (sequence + 1) & 0xFFFFFFFF
             if packet_count % PRINT_EVERY == 0:
                 distances = ", ".join(f"{value:.2f}" for value in packet["distances"])
                 age = time.time() - packet["timestamp"]
@@ -1201,7 +1319,7 @@ def main():
     parser.add_argument("--pc-ip", default=PC_IP, help="IP address of the PC display")
     args = parser.parse_args()
 
-    control_receiver = ControlReceiver() if USE_LIVE_DATA else None
+    control_receiver = ControlReceiver(shared) if USE_LIVE_DATA else None
     vehicle = VehicleSimulation()
     threads = [
         threading.Thread(target=lidar_loop),
