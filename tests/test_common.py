@@ -26,6 +26,9 @@ class MixTests(unittest.TestCase):
             with self.subTest(keys=keys):
                 self.assertEqual(mix(keys), expected)
 
+    def test_auxiliary_commands_do_not_change_drive_mixing(self):
+        self.assertEqual(mix({"up", "grabber_up"}), (1.0, 1.0))
+
 
 class ControlPacketTests(unittest.TestCase):
     def test_unpack_control_packet(self):
@@ -33,6 +36,17 @@ class ControlPacketTests(unittest.TestCase):
         self.assertEqual(
             unpack_control_packet(packet),
             (42, 12.5, {"up", "left"}),
+        )
+
+    def test_unpack_control_packet_with_grabber_and_claw_commands(self):
+        packet = struct.pack(CONTROL_PACKET_FORMAT, 43, 12.6, 0xF0)
+        self.assertEqual(
+            unpack_control_packet(packet),
+            (
+                43,
+                12.6,
+                {"grabber_up", "grabber_down", "claw_open", "claw_close"},
+            ),
         )
 
     def test_rejects_malformed_packet(self):

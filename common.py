@@ -19,7 +19,16 @@ CONTROL_TIMEOUT_SECONDS = 0.3
 TRACK_WIDTH = 0.35  # metres between the tank's tracks
 MAX_SPEED = 1.0  # metres per second at full track command
 CONTROL_PACKET_FORMAT = "!IdB"  # sequence, PC perf_counter timestamp, key bits
-CONTROL_KEY_BITS = {"up": 0x01, "down": 0x02, "left": 0x04, "right": 0x08}
+CONTROL_KEY_BITS = {
+    "up": 0x01,
+    "down": 0x02,
+    "left": 0x04,
+    "right": 0x08,
+    "grabber_up": 0x10,
+    "grabber_down": 0x20,
+    "claw_open": 0x40,
+    "claw_close": 0x80,
+}
 MAX_PACKET_SIZE = 60 * 1024
 _ANCHOR_COORDINATES = (
     [0.0, 0.0, 1.2],
@@ -64,7 +73,8 @@ def unpack_control_packet(packet: bytes) -> tuple[int, float, set[str]]:
         raise ValueError(f"Expected {packet_struct.size}-byte control packet")
 
     sequence, pc_timestamp, key_bits = packet_struct.unpack(packet)
-    if key_bits & ~0x0F:
+    valid_key_bits = sum(CONTROL_KEY_BITS.values())
+    if key_bits & ~valid_key_bits:
         raise ValueError("Control packet contains unknown key bits")
     if not math.isfinite(pc_timestamp):
         raise ValueError("Control packet timestamp must be finite")

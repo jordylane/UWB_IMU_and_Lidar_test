@@ -24,14 +24,29 @@ from PySide6.QtWidgets import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common import UDP_PORT, anchors, decode_packet
+from common import (
+    CONTROL_PORT,
+    CONTROL_RATE_HZ,
+    PI_IP,
+    UDP_PORT,
+    anchors,
+    decode_packet,
+    pack_control_packet,
+)
 
-PI_IP = "192.168.1.50"
-CONTROL_PORT = 5006
-CONTROL_RATE_HZ = 20
 PRINT_EVERY = 10
 PLOT_SPAN = 5.0
 HISTORY_LENGTH = 100
+CONTROL_KEYS = {
+    b"L": "left",
+    b"R": "right",
+    b"U": "up",
+    b"D": "down",
+    b"w": "grabber_up",
+    b"s": "grabber_down",
+    b"d": "claw_open",
+    b"a": "claw_close",
+}
 
 WINDOW = "#1e1f22"
 PANEL = "#2b2d31"
@@ -382,6 +397,7 @@ class MainWindow(QMainWindow):
         self.stop_event = threading.Event()
         self.held = set()
         self.last_command = ""
+        self.control_sequence = 0
         self.raw_x = []
         self.raw_y = []
         self.filtered_x = []
@@ -563,15 +579,19 @@ class MainWindow(QMainWindow):
         self.arm_button.style().polish(self.arm_button)
         if not armed:
             self._clear_held()
+            self._send_control_state()
 
     def _clear_held(self):
+        was_armed = self.arm_button.isChecked()
         self.held.clear()
         self._update_command_label()
+        if was_armed:
+            self._send_control_state()
 
     def _update_command_label(self):
         command = "+".join(
             key.decode("ascii")
-            for key in (b"L", b"R", b"U", b"D")
+            for key in (b"L", b"R", b"U", b"D", b"w", b"s", b"d", b"a")
             if key in self.held
         )
         if command == self.last_command:
@@ -579,17 +599,29 @@ class MainWindow(QMainWindow):
         self.last_command = command
         self.command_label.setText(f"Command: {command or 'idle'}")
         print(command or "released", flush=True)
+        if self.arm_button.isChecked():
+            self._send_control_state()
 
     def send_held_commands(self):
-        if not self.arm_button.isChecked() or not self.held:
+        if not self.arm_button.isChecked():
             return
-        for key in (b"L", b"R", b"U", b"D"):
-            if key not in self.held:
-                continue
-            try:
-                self.control_socket.sendto(key, (PI_IP, CONTROL_PORT))
-            except OSError as exc:
-                print(f"control UDP send failed: {exc}", flush=True)
+        self._send_control_state()
+
+    def _send_control_state(self):
+        keys = {
+            CONTROL_KEYS[key]
+            for key in self.held
+        }
+        packet = pack_control_packet(
+            self.control_sequence,
+            time.perf_counter(),
+            keys,
+        )
+        try:
+            self.control_socket.sendto(packet, (PI_IP, CONTROL_PORT))
+        except OSError as exc:
+            print(f"control UDP send failed: {exc}", flush=True)
+        self.control_sequence = (self.control_sequence + 1) & 0xFFFFFFFF
 
     def _sequence_loss(self, sequences):
         if not sequences:
@@ -750,6 +782,10 @@ class MainWindow(QMainWindow):
             Qt.Key.Key_Right: b"R",
             Qt.Key.Key_Up: b"U",
             Qt.Key.Key_Down: b"D",
+            Qt.Key.Key_W: b"w",
+            Qt.Key.Key_S: b"s",
+            Qt.Key.Key_D: b"d",
+            Qt.Key.Key_A: b"a",
         }
         key = key_map.get(event.key())
         if key is not None and self.arm_button.isChecked():
@@ -767,6 +803,10 @@ class MainWindow(QMainWindow):
             Qt.Key.Key_Right: b"R",
             Qt.Key.Key_Up: b"U",
             Qt.Key.Key_Down: b"D",
+            Qt.Key.Key_W: b"w",
+            Qt.Key.Key_S: b"s",
+            Qt.Key.Key_D: b"d",
+            Qt.Key.Key_A: b"a",
         }
         key = key_map.get(event.key())
         if key is not None and key in self.held:
