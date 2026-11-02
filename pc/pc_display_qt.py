@@ -1,4 +1,5 @@
 import math
+import os
 import socket
 import sys
 import threading
@@ -7,8 +8,16 @@ import traceback
 from collections import deque
 from pathlib import Path
 
+os.environ["SDL_VIDEODRIVER"] = "dummy"
+os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
+
 import numpy as np
 import pyqtgraph as pg
+try:
+    import pygame
+except ImportError:
+    pygame = None
+
 from PySide6.QtCore import QPoint, Qt, QSize, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -743,6 +752,7 @@ class MainWindow(QMainWindow):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.shared_data = DisplayData()
         self.stop_event = threading.Event()
+        self.controller_joystick = None
         self.held = set()
         self.last_command = ""
         self.control_sequence = 0
@@ -765,6 +775,7 @@ class MainWindow(QMainWindow):
         self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         self._build_ui()
+        self._init_controller()
         self.link_details = LinkDetailsDialog(self)
         self.receiver = threading.Thread(
             target=receiver_loop,
@@ -972,9 +983,75 @@ class MainWindow(QMainWindow):
         self.position_status = QLabel("UWB: --, -- m")
         self.anchor_status = QLabel("Anchors: 4/4")
         self.packet_status = QLabel("Packets: 0")
+        self.controller_status = QLabel("Controller: checking")
+        self.controller_axes = QLabel("Axes: --")
+        self.controller_buttons = QLabel("Buttons: --")
         status.addWidget(self.position_status)
         status.addWidget(self.anchor_status)
         status.addWidget(self.packet_status)
+        status.addWidget(self.controller_status)
+        status.addWidget(self.controller_axes)
+        status.addWidget(self.controller_buttons)
+
+    def _init_controller(self):
+        if pygame is None:
+            self.controller_status.setText("Controller: pygame unavailable")
+            return
+        try:
+            pygame.display.init()
+            pygame.joystick.init()
+            self._update_controller_status()
+        except pygame.error as exc:
+            self.controller_status.setText(f"Controller: unavailable ({exc})")
+
+    def _update_controller_status(self):
+        if pygame is None:
+            return
+        try:
+            pygame.event.pump()
+            for event in pygame.event.get():
+                if event.type == pygame.JOYDEVICEREMOVED:
+                    self.controller_joystick = None
+
+            if self.controller_joystick is None and pygame.joystick.get_count():
+                self.controller_joystick = pygame.joystick.Joystick(0)
+                self.controller_joystick.init()
+
+            joystick = self.controller_joystick
+            if joystick is None:
+                self.controller_status.setText("Controller: not detected")
+                self.controller_axes.setText("Axes: --")
+                self.controller_buttons.setText("Buttons: --")
+                return
+
+            self.controller_status.setText(
+                f"Controller: {joystick.get_name()}"
+            )
+            axes = [
+                f"{index}={joystick.get_axis(index):+.2f}"
+                for index in range(joystick.get_numaxes())
+            ]
+            pressed = [
+                str(index)
+                for index in range(joystick.get_numbuttons())
+                if joystick.get_button(index)
+            ]
+            self.controller_axes.setText(
+                "Axes: " + (" ".join(axes) if axes else "--")
+            )
+            self.controller_buttons.setText(
+                "Buttons: " + (", ".join(pressed) if pressed else "none")
+            )
+        except pygame.error:
+            if self.controller_joystick is not None:
+                try:
+                    self.controller_joystick.quit()
+                except pygame.error:
+                    pass
+            self.controller_joystick = None
+            self.controller_status.setText("Controller: disconnected")
+            self.controller_axes.setText("Axes: --")
+            self.controller_buttons.setText("Buttons: --")
 
     def _add_keypad(self, parent_layout, title, rows, key_style):
         keypad = QVBoxLayout()
@@ -1197,6 +1274,7 @@ class MainWindow(QMainWindow):
 
     def update_dashboard(self):
         self._fit_square_plots()
+        self._update_controller_status()
         now = time.monotonic()
         with self.shared_data.lock:
             snapshot = self.shared_data.link_monitor.snapshot(now)
@@ -1327,6 +1405,13 @@ class MainWindow(QMainWindow):
         self.receiver_socket.close()
         self.control_socket.close()
         self.receiver.join()
+        if pygame is not None:
+            if self.controller_joystick is not None:
+                try:
+                    self.controller_joystick.quit()
+                except pygame.error:
+                    pass
+            pygame.quit()
         event.accept()
 
 

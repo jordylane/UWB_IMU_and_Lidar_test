@@ -2,3 +2,4 @@ matplotlib
 numpy
 PySide6
 pyqtgraph
+pygame
