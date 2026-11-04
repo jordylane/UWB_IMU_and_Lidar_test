@@ -18,7 +18,7 @@ try:
 except ImportError:
     pygame = None
 
-from PySide6.QtCore import QPoint, Qt, QSize, QTimer
+from PySide6.QtCore import QPoint, QRect, Qt, QSize, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -47,6 +47,7 @@ from common import (
     decode_packet,
     pack_control_packet,
 )
+from pc.controller_input import controller_commands
 
 PRINT_EVERY = 10
 PLOT_SPAN = 5.0
@@ -447,6 +448,62 @@ class CompassWidget(QWidget):
         )
 
 
+class ControllerSticksWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(190, 100)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.axes = (0.0, 0.0, 0.0, 0.0)
+        self.active_sticks = (False, False)
+
+    def set_sticks(self, axes, active_sticks):
+        self.axes = axes
+        self.active_sticks = active_sticks
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        radius = 29
+        centers = (QPoint(47, 39), QPoint(143, 39))
+        labels = ("Movement", "Grabber / claw")
+        colors = (BLUE, AMBER)
+
+        for index, center in enumerate(centers):
+            active = self.active_sticks[index]
+            color = QColor(colors[index] if active else BORDER)
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(QColor("#222428"))
+            painter.drawEllipse(center, radius, radius)
+
+            painter.setPen(QPen(QColor(BORDER), 1))
+            painter.drawLine(
+                center.x() - radius + 5,
+                center.y(),
+                center.x() + radius - 5,
+                center.y(),
+            )
+            painter.drawLine(
+                center.x(),
+                center.y() - radius + 5,
+                center.x(),
+                center.y() + radius - 5,
+            )
+
+            axis_index = index * 2
+            knob_x = center.x() + round(self.axes[axis_index] * radius * 0.65)
+            knob_y = center.y() + round(self.axes[axis_index + 1] * radius * 0.65)
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(QColor(colors[index] if active else MUTED))
+            painter.drawEllipse(QPoint(knob_x, knob_y), 8, 8)
+            painter.setPen(QColor(TEXT))
+            painter.drawText(
+                QRect(center.x() - 47, 76, 94, 18),
+                Qt.AlignmentFlag.AlignCenter,
+                labels[index],
+            )
+
+
 class SquarePlotWidget(pg.PlotWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -748,12 +805,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("UWB / IMU / Lidar Dashboard")
-        self.setMinimumSize(1100, 700)
+        self.setMinimumSize(1200, 700)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.shared_data = DisplayData()
         self.stop_event = threading.Event()
         self.controller_joystick = None
         self.held = set()
+        self.controller_held = set()
         self.last_command = ""
         self.control_sequence = 0
         self.raw_x = []
@@ -876,6 +934,8 @@ class MainWindow(QMainWindow):
             ),
             "arrowKey",
         )
+        self.controller_sticks = ControllerSticksWidget()
+        controls_layout.addWidget(self.controller_sticks)
         top_bar.addWidget(controls_panel, 0)
 
         top_bar.addStretch(1)
@@ -1022,14 +1082,19 @@ class MainWindow(QMainWindow):
                 self.controller_status.setText("Controller: not detected")
                 self.controller_axes.setText("Axes: --")
                 self.controller_buttons.setText("Buttons: --")
+                self._set_controller_input([])
                 return
 
             self.controller_status.setText(
                 f"Controller: {joystick.get_name()}"
             )
-            axes = [
-                f"{index}={joystick.get_axis(index):+.2f}"
+            axis_values = [
+                joystick.get_axis(index)
                 for index in range(joystick.get_numaxes())
+            ]
+            axes = [
+                f"{index}={value:+.2f}"
+                for index, value in enumerate(axis_values)
             ]
             pressed = [
                 str(index)
@@ -1042,6 +1107,7 @@ class MainWindow(QMainWindow):
             self.controller_buttons.setText(
                 "Buttons: " + (", ".join(pressed) if pressed else "none")
             )
+            self._set_controller_input(axis_values)
         except pygame.error:
             if self.controller_joystick is not None:
                 try:
@@ -1052,6 +1118,24 @@ class MainWindow(QMainWindow):
             self.controller_status.setText("Controller: disconnected")
             self.controller_axes.setText("Axes: --")
             self.controller_buttons.setText("Buttons: --")
+            self._set_controller_input([])
+
+    def _set_controller_input(self, axes):
+        stick_axes = tuple((list(axes[:4]) + [0.0] * 4)[:4])
+        commands = controller_commands(stick_axes)
+        movement_commands = {b"L", b"R", b"U", b"D"}
+        grabber_commands = {b"w", b"s", b"a", b"d"}
+        self.controller_sticks.set_sticks(
+            stick_axes,
+            (
+                bool(commands & movement_commands),
+                bool(commands & grabber_commands),
+            ),
+        )
+        active_commands = commands if self.arm_button.isChecked() else set()
+        if active_commands != self.controller_held:
+            self.controller_held = active_commands
+            self._update_command_label()
 
     def _add_keypad(self, parent_layout, title, rows, key_style):
         keypad = QVBoxLayout()
@@ -1091,6 +1175,7 @@ class MainWindow(QMainWindow):
     def _clear_held(self):
         was_armed = self.arm_button.isChecked()
         self.held.clear()
+        self.controller_held.clear()
         self._update_command_label()
         if was_armed:
             self._send_control_state()
@@ -1099,7 +1184,7 @@ class MainWindow(QMainWindow):
         command = "+".join(
             key.decode("ascii")
             for key in (b"L", b"R", b"U", b"D", b"w", b"s", b"d", b"a")
-            if key in self.held
+            if key in self.held or key in self.controller_held
         )
         for key, indicator in self.key_indicators.items():
             pressed = key in self.held
@@ -1122,7 +1207,7 @@ class MainWindow(QMainWindow):
     def _send_control_state(self):
         keys = {
             CONTROL_KEYS[key]
-            for key in self.held
+            for key in self.held | self.controller_held
         }
         packet = pack_control_packet(
             self.control_sequence,
@@ -1181,14 +1266,17 @@ class MainWindow(QMainWindow):
             command_text = "--"
             command_color = MUTED
         elif cmd_age < COMMAND_TIMEOUT_S or (
-            (not self.arm_button.isChecked() or not self.held)
+            (
+                not self.arm_button.isChecked()
+                or not (self.held | self.controller_held)
+            )
             and not snapshot["failsafe"]
         ):
             command_text = "Commands OK"
             command_color = GREEN
         elif (
             self.arm_button.isChecked()
-            and self.held
+            and (self.held or self.controller_held)
             and cmd_age > LINK_THRESHOLDS["command_late_s"]
         ):
             command_text = "Commands not reaching Pi"
