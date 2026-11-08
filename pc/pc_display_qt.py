@@ -18,7 +18,7 @@ try:
 except ImportError:
     pygame = None
 
-from PySide6.QtCore import QPoint, QRect, Qt, QSize, QTimer
+from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QSize, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -466,8 +466,8 @@ class ControllerSticksWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         radius = 29
         centers = (QPoint(47, 39), QPoint(143, 39))
-        labels = ("Movement", "Grabber / claw")
-        colors = (BLUE, AMBER)
+        labels = ("Grabber / claw", "Movement")
+        colors = (AMBER, BLUE)
 
         for index, center in enumerate(centers):
             active = self.active_sticks[index]
@@ -812,6 +812,7 @@ class MainWindow(QMainWindow):
         self.controller_joystick = None
         self.held = set()
         self.controller_held = set()
+        self.estop_active = False
         self.last_command = ""
         self.control_sequence = 0
         self.raw_x = []
@@ -833,6 +834,7 @@ class MainWindow(QMainWindow):
         self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         self._build_ui()
+        QApplication.instance().installEventFilter(self)
         self._init_controller()
         self.link_details = LinkDetailsDialog(self)
         self.receiver = threading.Thread(
@@ -942,13 +944,19 @@ class MainWindow(QMainWindow):
         status_block = QVBoxLayout()
         status_block.setSpacing(3)
         status_block.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.estop_button = QPushButton("E-STOP CLEAR")
+        self.estop_button.setObjectName("estopButton")
+        self.estop_button.setProperty("active", "false")
+        self.estop_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.estop_button.clicked.connect(self._trigger_estop)
+        status_block.addWidget(self.estop_button, 0, Qt.AlignmentFlag.AlignRight)
         self.arm_button = QPushButton("DISARMED")
         self.arm_button.setObjectName("armButton")
         self.arm_button.setCheckable(True)
         self.arm_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.arm_button.toggled.connect(self._set_armed)
         status_block.addWidget(self.arm_button, 0, Qt.AlignmentFlag.AlignRight)
-        shortcut_label = QLabel("Space to arm / disarm")
+        shortcut_label = QLabel("Enter: E-stop | Space: reset / arm")
         shortcut_label.setObjectName("mutedText")
         status_block.addWidget(shortcut_label, 0, Qt.AlignmentFlag.AlignRight)
         link_status_row = QHBoxLayout()
@@ -1128,8 +1136,8 @@ class MainWindow(QMainWindow):
         self.controller_sticks.set_sticks(
             stick_axes,
             (
-                bool(commands & movement_commands),
                 bool(commands & grabber_commands),
+                bool(commands & movement_commands),
             ),
         )
         active_commands = commands if self.arm_button.isChecked() else set()
@@ -1164,6 +1172,9 @@ class MainWindow(QMainWindow):
         parent_layout.addLayout(keypad)
 
     def _set_armed(self, armed):
+        if armed and self.estop_active:
+            self.arm_button.setChecked(False)
+            return
         self.arm_button.setText("ARMED" if armed else "DISARMED")
         self.arm_button.setProperty("armed", "true" if armed else "false")
         self.arm_button.style().unpolish(self.arm_button)
@@ -1171,6 +1182,29 @@ class MainWindow(QMainWindow):
         if not armed:
             self._clear_held()
             self._send_control_state()
+
+    def _trigger_estop(self):
+        if self.estop_active:
+            return
+        self.estop_active = True
+        self.estop_button.setText("E-STOP ACTIVE — Space to reset")
+        self.estop_button.setProperty("active", "true")
+        self.estop_button.style().unpolish(self.estop_button)
+        self.estop_button.style().polish(self.estop_button)
+        if self.arm_button.isChecked():
+            self.arm_button.setChecked(False)
+        else:
+            self._clear_held()
+            self._send_control_state()
+
+    def _reset_estop(self):
+        if not self.estop_active:
+            return
+        self.estop_active = False
+        self.estop_button.setText("E-STOP CLEAR")
+        self.estop_button.setProperty("active", "false")
+        self.estop_button.style().unpolish(self.estop_button)
+        self.estop_button.style().polish(self.estop_button)
 
     def _clear_held(self):
         was_armed = self.arm_button.isChecked()
@@ -1200,15 +1234,20 @@ class MainWindow(QMainWindow):
             self._send_control_state()
 
     def send_held_commands(self):
+        if self.estop_active:
+            self._send_control_state()
+            return
         if not self.arm_button.isChecked():
             return
         self._send_control_state()
 
     def _send_control_state(self):
-        keys = {
-            CONTROL_KEYS[key]
-            for key in self.held | self.controller_held
-        }
+        keys = set()
+        if not self.estop_active:
+            keys = {
+                CONTROL_KEYS[key]
+                for key in self.held | self.controller_held
+            }
         packet = pack_control_packet(
             self.control_sequence,
             time.perf_counter(),
@@ -1436,34 +1475,64 @@ class MainWindow(QMainWindow):
         pass
 
     def keyPressEvent(self, event):
-        if event.isAutoRepeat():
-            return
-        if event.key() == Qt.Key.Key_Space:
-            self._clear_held()
-            self.arm_button.setChecked(not self.arm_button.isChecked())
-            event.accept()
-            return
-        key_map = {
-            Qt.Key.Key_Left: b"L",
-            Qt.Key.Key_Right: b"R",
-            Qt.Key.Key_Up: b"U",
-            Qt.Key.Key_Down: b"D",
-            Qt.Key.Key_W: b"w",
-            Qt.Key.Key_S: b"s",
-            Qt.Key.Key_D: b"d",
-            Qt.Key.Key_A: b"a",
-        }
-        key = key_map.get(event.key())
-        if key is not None and self.arm_button.isChecked():
-            self.held.add(key)
-            self._update_command_label()
-            event.accept()
+        if self._handle_control_key_press(event):
             return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
-        if event.isAutoRepeat():
+        if self._handle_control_key_release(event):
             return
+        super().keyReleaseEvent(event)
+
+    def eventFilter(self, watched, event):
+        if (
+            isinstance(watched, QWidget)
+            and (watched is self or self.isAncestorOf(watched))
+            and self.isActiveWindow()
+        ):
+            if event.type() == QEvent.Type.KeyPress:
+                return self._handle_control_key_press(event)
+            if event.type() == QEvent.Type.KeyRelease:
+                return self._handle_control_key_release(event)
+        return super().eventFilter(watched, event)
+
+    def _handle_control_key_press(self, event):
+        if event.isAutoRepeat():
+            return True
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._trigger_estop()
+            event.accept()
+            return True
+        if event.key() == Qt.Key.Key_Space:
+            if self.estop_active:
+                self._reset_estop()
+                event.accept()
+                return True
+            self._clear_held()
+            self.arm_button.setChecked(not self.arm_button.isChecked())
+            event.accept()
+            return True
+        key = self._control_key(event.key())
+        if key is not None and self.arm_button.isChecked():
+            self.held.add(key)
+            self._update_command_label()
+            event.accept()
+            return True
+        return False
+
+    def _handle_control_key_release(self, event):
+        if event.isAutoRepeat():
+            return True
+        key = self._control_key(event.key())
+        if key is not None and key in self.held:
+            self.held.remove(key)
+            self._update_command_label()
+            event.accept()
+            return True
+        return False
+
+    @staticmethod
+    def _control_key(key):
         key_map = {
             Qt.Key.Key_Left: b"L",
             Qt.Key.Key_Right: b"R",
@@ -1474,19 +1543,14 @@ class MainWindow(QMainWindow):
             Qt.Key.Key_D: b"d",
             Qt.Key.Key_A: b"a",
         }
-        key = key_map.get(event.key())
-        if key is not None and key in self.held:
-            self.held.remove(key)
-            self._update_command_label()
-            event.accept()
-            return
-        super().keyReleaseEvent(event)
+        return key_map.get(key)
 
     def focusOutEvent(self, event):
         self._clear_held()
         super().focusOutEvent(event)
 
     def closeEvent(self, event):
+        QApplication.instance().removeEventFilter(self)
         self.stop_event.set()
         self.update_timer.stop()
         self.control_timer.stop()
@@ -1562,6 +1626,19 @@ def main():
         }}
         QPushButton#armButton[armed="true"] {{ background: {GREEN}; }}
         QPushButton#armButton:hover {{ border-color: {TEXT}; }}
+        QPushButton#estopButton {{
+            background: {GREEN};
+            border: 1px solid {GREEN};
+            border-radius: 6px;
+            color: {WINDOW};
+            padding: 7px 14px;
+            font-weight: bold;
+        }}
+        QPushButton#estopButton[active="true"] {{
+            background: {RED};
+            border-color: {RED};
+            color: white;
+        }}
         QFrame#cameraPanel {{
             background: {PANEL};
             border: 2px dashed {BORDER};

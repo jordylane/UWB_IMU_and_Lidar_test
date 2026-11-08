@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import (
     CONTROL_PORT,
+    CONTROL_MONITOR_PORT,
     CONTROL_TIMEOUT_SECONDS,
     COMMAND_TIMEOUT_S,
     MAX_SPEED,
@@ -101,7 +102,10 @@ class ControlReceiver:
             self.reported_stick_y = stick_y
 
     def _receive_loop(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control_socket:
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control_socket,
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as monitor_socket,
+        ):
             control_socket.bind(("", CONTROL_PORT))
             control_socket.settimeout(0.05)
             while not self.stop_event.is_set():
@@ -116,6 +120,13 @@ class ControlReceiver:
                     return
 
                 if packet is not None:
+                    try:
+                        monitor_socket.sendto(
+                            packet, ("127.0.0.1", CONTROL_MONITOR_PORT)
+                        )
+                    except OSError as exc:
+                        print(f"control monitor relay failed: {exc}", flush=True)
+
                     joystick_values = (
                         self._parse_joystick_packet(packet)
                         if packet.startswith(b"J,")

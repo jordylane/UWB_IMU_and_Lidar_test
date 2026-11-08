@@ -6,12 +6,14 @@ Install the requirements for the relevant device from the repository root.
 
 ```powershell
 python -m pip install -r pi/requirements.txt
-python -m pi.pi_sensors --pc-ip 192.168.1.115
+python launch.py
 ```
 
-`--pc-ip` is optional; the default destination is `192.168.1.115`. Keep
-`USE_LIVE_DATA = False` in `pi/pi_sensors.py` to replay the recorded capture
-files, or set it to `True` to read from the sensors.
+The launcher starts both `pi/pi_control_monitor.py` and `pi/pi_sensors.py`
+under the current Python interpreter, prefixes each output line, and stops both
+processes if either one exits. To run only the sensor process, use
+`python -m pi.pi_sensors --pc-ip 192.168.1.115`; the `--pc-ip` option is
+optional and defaults to `192.168.1.115`.
 
 ## Windows PC
 

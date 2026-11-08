@@ -7,22 +7,22 @@ def controller_commands(axes):
     left_x, left_y, right_x, right_y = values
     commands = set()
 
-    if left_x < -DEADZONE:
+    if right_x < -DEADZONE:
         commands.add(b"L")
-    elif left_x > DEADZONE:
+    elif right_x > DEADZONE:
         commands.add(b"R")
-    if left_y < -DEADZONE:
+    if right_y < -DEADZONE:
         commands.add(b"U")
-    elif left_y > DEADZONE:
+    elif right_y > DEADZONE:
         commands.add(b"D")
 
-    if right_x < -DEADZONE:
+    if left_x < -DEADZONE:
         commands.add(b"a")
-    elif right_x > DEADZONE:
+    elif left_x > DEADZONE:
         commands.add(b"d")
-    if right_y < -DEADZONE:
+    if left_y < -DEADZONE:
         commands.add(b"w")
-    elif right_y > DEADZONE:
+    elif left_y > DEADZONE:
         commands.add(b"s")
 
     return commands

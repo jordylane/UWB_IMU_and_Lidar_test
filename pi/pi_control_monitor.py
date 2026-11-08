@@ -1,8 +1,13 @@
 import argparse
 import socket
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import (
+    CONTROL_MONITOR_PORT,
     CONTROL_PORT,
     CONTROL_RATE_HZ,
     CONTROL_TIMEOUT_SECONDS,
@@ -27,7 +32,16 @@ def print_status(start, sequence, keys, age_ms):
 def main():
     parser = argparse.ArgumentParser(description="Monitor PC vehicle-control packets.")
     parser.add_argument("--all", action="store_true", help="Print every valid packet.")
+    parser.add_argument(
+        "--forwarded",
+        action="store_true",
+        help="Listen for packets forwarded by pi_sensors.",
+    )
     args = parser.parse_args()
+    listen_address = (
+        ("127.0.0.1", CONTROL_MONITOR_PORT)
+        if args.forwarded else ("0.0.0.0", CONTROL_PORT)
+    )
     start = time.perf_counter()
     last_packet_time = None
     last_print_time = 0.0
@@ -38,7 +52,7 @@ def main():
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control_socket:
         try:
-            control_socket.bind(("0.0.0.0", CONTROL_PORT))
+            control_socket.bind(listen_address)
         except OSError as exc:
             # Test with this script instead of the main Pi script, or configure
             # SO_REUSEADDR/SO_REUSEPORT; UDP may still deliver to only one socket
@@ -52,7 +66,10 @@ def main():
             return
 
         control_socket.settimeout(0.05)
-        print(f"Listening on 0.0.0.0:{CONTROL_PORT} at {CONTROL_RATE_HZ} Hz")
+        print(
+            f"Listening on {listen_address[0]}:{listen_address[1]} "
+            f"at {CONTROL_RATE_HZ} Hz"
+        )
         try:
             while True:
                 try:
