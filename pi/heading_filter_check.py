@@ -4,6 +4,8 @@ import math
 import sys
 from pathlib import Path
 
+DATA_DIR = Path(__file__).resolve().parent
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from kalman import (
@@ -22,7 +24,13 @@ def main():
     parser.add_argument(
         "filename",
         nargs="?",
-        default=str(Path(__file__).with_name("attitude_capture.csv")),
+        help="optional attitude capture filename",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DATA_DIR,
+        help=f"directory containing sensor data files (default: {DATA_DIR})",
     )
     parser.add_argument(
         "--bias-interval",
@@ -31,6 +39,15 @@ def main():
         help="Seconds between printed gyro-bias estimates.",
     )
     args = parser.parse_args()
+    data_dir = args.data_dir.expanduser().resolve()
+    capture_path = Path(args.filename) if args.filename else (
+        data_dir / "attitude_capture.csv"
+    )
+    if not capture_path.is_absolute():
+        capture_path = data_dir / capture_path
+    capture_path = capture_path.resolve()
+    if not capture_path.is_file():
+        raise FileNotFoundError(f"Attitude capture file not found: {capture_path}")
 
     heading_filter = HeadingKalmanFilter()
     errors = []
@@ -38,7 +55,7 @@ def main():
     previous_yaw = None
     next_bias_report = 0.0
 
-    with open(args.filename, newline="") as capture:
+    with open(capture_path, newline="") as capture:
         rows = csv.reader(capture)
         for row in rows:
             if not row or row[0].startswith("raw_mag_heading_deg"):
@@ -89,7 +106,7 @@ def main():
             previous_yaw = yaw
 
     if not errors:
-        raise ValueError(f"No capture samples found in {args.filename}")
+        raise ValueError(f"No capture samples found in {capture_path}")
     rms = math.degrees(math.sqrt(sum(error * error for error in errors) / len(errors)))
     print(f"RMS raw-magnetometer vs filtered heading difference: {rms:.3f} deg")
 

@@ -11,6 +11,8 @@ import numpy as np
 import sys
 from pathlib import Path
 
+DATA_DIR = Path(__file__).resolve().parent
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import (
@@ -779,9 +781,11 @@ def lidar_loop():
 # --------------------------------------------------
 
     if USE_LIVE_DATA:
-        source = SerialLidarSource(SERIAL_PORT, record_filename="lidar_capture.bin")
+        source = SerialLidarSource(
+            SERIAL_PORT, record_filename=DATA_DIR / "lidar_capture.bin"
+        )
     else:
-        source = FileLidarSource("lidar_capture.bin")
+        source = FileLidarSource(DATA_DIR / "lidar_capture.bin")
     
 
     new_sample = False
@@ -904,9 +908,11 @@ def lidar_loop():
 def uwb_loop():
         
     if USE_LIVE_DATA:
-        source = SerialUWBSource('/dev/ttyUSB0', record_filename="uwb_capture.txt")
+        source = SerialUWBSource(
+            "/dev/ttyUSB0", record_filename=DATA_DIR / "uwb_capture.txt"
+        )
     else:
-        source = FileUWBSource("uwb_capture.txt", baudrate=115200)
+        source = FileUWBSource(DATA_DIR / "uwb_capture.txt", baudrate=115200)
     
     
     new_sample = False
@@ -1027,9 +1033,13 @@ def accelerometer_loop():
 # --------------------------------------------------
 
     if USE_LIVE_DATA:
-        acc_source = LiveAccSource(record_filename="accelerometer_capture.csv")
+        acc_source = LiveAccSource(
+            record_filename=DATA_DIR / "accelerometer_capture.csv"
+        )
     else:
-        acc_source = FileAccSource("accelerometer_capture.csv", sample_period=0.001)
+        acc_source = FileAccSource(
+            DATA_DIR / "accelerometer_capture.csv", sample_period=0.001
+        )
 
 
     elapsed = 0.0
@@ -1097,9 +1107,13 @@ def accelerometer_loop():
 def attitude_loop():
     
     if USE_LIVE_DATA:
-        att_source = LiveAttSource(record_filename="attitude_capture.csv")
+        att_source = LiveAttSource(
+            record_filename=DATA_DIR / "attitude_capture.csv"
+        )
     else:
-        att_source = FileAttSource("attitude_capture.csv", sample_period=0.0365)
+        att_source = FileAttSource(
+            DATA_DIR / "attitude_capture.csv", sample_period=0.0365
+        )
 
     elapsed = 0.0
     prev_att_elapsed = 0.0
@@ -1313,11 +1327,33 @@ def sender_loop(pc_ip, control_receiver=None, vehicle=None):
 # --------------------------------------------------
 
 def main():
-    global running
+    global running, DATA_DIR
 
     parser = argparse.ArgumentParser(description="Send UWB, IMU, and lidar data over UDP")
     parser.add_argument("--pc-ip", default=PC_IP, help="IP address of the PC display")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DATA_DIR,
+        help=f"directory containing sensor data files (default: {DATA_DIR})",
+    )
     args = parser.parse_args()
+    DATA_DIR = args.data_dir.expanduser().resolve()
+    print(f"Sensor data directory: {DATA_DIR}", flush=True)
+
+    if not USE_LIVE_DATA:
+        required_files = (
+            "lidar_capture.bin",
+            "uwb_capture.txt",
+            "accelerometer_capture.csv",
+            "attitude_capture.csv",
+        )
+        for filename in required_files:
+            path = DATA_DIR / filename
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Required sensor data file not found: {path}"
+                )
 
     control_receiver = ControlReceiver(shared) if USE_LIVE_DATA else None
     vehicle = VehicleSimulation()

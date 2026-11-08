@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import numpy as np
 from pynput import keyboard
+from pathlib import Path
 
 from common import (
     CONTROL_MONITOR_PORT,
@@ -29,6 +30,7 @@ from kalman import (
 )
 
 USE_LIVE_DATA = False
+DATA_DIR = Path(__file__).resolve().parent / "pi"
 
 if USE_LIVE_DATA:
     from sense_hat import SenseHat
@@ -595,9 +597,11 @@ def lidar_loop():
 # --------------------------------------------------
 
     if USE_LIVE_DATA:
-        source = SerialLidarSource(SERIAL_PORT, record_filename="lidar_capture.bin")
+        source = SerialLidarSource(
+            SERIAL_PORT, record_filename=DATA_DIR / "lidar_capture.bin"
+        )
     else:
-        source = FileLidarSource("lidar_capture.bin")
+        source = FileLidarSource(DATA_DIR / "lidar_capture.bin")
     
 
     new_sample = False
@@ -720,9 +724,11 @@ def lidar_loop():
 def uwb_loop():
         
     if USE_LIVE_DATA:
-        source = SerialUWBSource('/dev/ttyUSB0', record_filename="uwb_capture.txt")
+        source = SerialUWBSource(
+            "/dev/ttyUSB0", record_filename=DATA_DIR / "uwb_capture.txt"
+        )
     else:
-        source = FileUWBSource("uwb_capture.txt", baudrate=115200)
+        source = FileUWBSource(DATA_DIR / "uwb_capture.txt", baudrate=115200)
     
     
     new_sample = False
@@ -842,9 +848,13 @@ def accelerometer_loop():
 # --------------------------------------------------
 
     if USE_LIVE_DATA:
-        acc_source = LiveAccSource(record_filename="accelerometer_capture.csv")
+        acc_source = LiveAccSource(
+            record_filename=DATA_DIR / "accelerometer_capture.csv"
+        )
     else:
-        acc_source = FileAccSource("accelerometer_capture.csv", sample_period=0.001)
+        acc_source = FileAccSource(
+            DATA_DIR / "accelerometer_capture.csv", sample_period=0.001
+        )
 
 
     elapsed = 0.0
@@ -912,9 +922,13 @@ def accelerometer_loop():
 def attitude_loop():
     
     if USE_LIVE_DATA:
-        att_source = LiveAttSource(record_filename="attitude_capture.csv")
+        att_source = LiveAttSource(
+            record_filename=DATA_DIR / "attitude_capture.csv"
+        )
     else:
-        att_source = FileAttSource("attitude_capture.csv", sample_period=0.0365)
+        att_source = FileAttSource(
+            DATA_DIR / "attitude_capture.csv", sample_period=0.0365
+        )
 
     elapsed = 0.0
     prev_att_elapsed = 0.0
