@@ -3,6 +3,7 @@ import unittest
 
 from common import (
     CONTROL_PACKET_FORMAT,
+    control_destinations,
     mix,
     unpack_control_packet,
 )
@@ -52,6 +53,12 @@ class ControlPacketTests(unittest.TestCase):
     def test_rejects_malformed_packet(self):
         with self.assertRaises(ValueError):
             unpack_control_packet(b"short")
+
+    def test_control_destinations_include_sensor_and_monitor_udp_ports(self):
+        self.assertEqual(
+            control_destinations("192.0.2.10"),
+            (("192.0.2.10", 5006), ("192.0.2.10", 5007)),
+        )
 
 
 if __name__ == "__main__":

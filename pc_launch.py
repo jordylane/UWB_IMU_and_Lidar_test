@@ -1,3 +1,4 @@
+import argparse
 import math
 import os
 import socket
@@ -34,7 +35,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
 
 from common import (
     COMMAND_TIMEOUT_S,
@@ -44,11 +46,13 @@ from common import (
     PI_IP,
     UDP_PORT,
     anchors,
+    control_destinations,
     decode_packet,
     pack_control_packet,
 )
 from pc.controller_input import controller_commands
 
+DEFAULT_PI_IP = PI_IP
 PRINT_EVERY = 10
 PLOT_SPAN = 5.0
 HISTORY_LENGTH = 100
@@ -802,7 +806,7 @@ class LinkDetailsDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, pi_ip=DEFAULT_PI_IP):
         super().__init__()
         self.setWindowTitle("UWB / IMU / Lidar Dashboard")
         self.setMinimumSize(1200, 700)
@@ -815,6 +819,7 @@ class MainWindow(QMainWindow):
         self.estop_active = False
         self.last_command = ""
         self.control_sequence = 0
+        self.pi_ip = pi_ip
         self.raw_x = []
         self.raw_y = []
         self.filtered_x = []
@@ -823,7 +828,7 @@ class MainWindow(QMainWindow):
         self.latest_y = 0.0
         self.heading_degrees = 0.0
         self.yaw = 0.0
-        self.pc_ip = self._get_local_ip()
+        self.pc_ip = self._get_local_ip(self.pi_ip)
         self.displayed_link_state = "waiting"
         self.original_title = "UWB / IMU / Lidar Dashboard"
         self.health_panels = []
@@ -852,10 +857,10 @@ class MainWindow(QMainWindow):
         self.control_timer.start(round(1000 / CONTROL_RATE_HZ))
 
     @staticmethod
-    def _get_local_ip():
+    def _get_local_ip(pi_ip):
         address_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            address_socket.connect((PI_IP, CONTROL_PORT))
+            address_socket.connect((pi_ip, CONTROL_PORT))
             return address_socket.getsockname()[0]
         except OSError:
             return "--"
@@ -985,7 +990,7 @@ class MainWindow(QMainWindow):
         status_block.addWidget(
             self.command_health_label, 0, Qt.AlignmentFlag.AlignRight
         )
-        ip_label = QLabel(f"Pi: {PI_IP} | PC: {self.pc_ip}")
+        ip_label = QLabel(f"Pi: {self.pi_ip} | PC: {self.pc_ip}")
         ip_label.setObjectName("mutedText")
         status_block.addWidget(ip_label, 0, Qt.AlignmentFlag.AlignRight)
         self.sender_label = QLabel("Waiting for data")
@@ -1253,10 +1258,15 @@ class MainWindow(QMainWindow):
             time.perf_counter(),
             keys,
         )
-        try:
-            self.control_socket.sendto(packet, (PI_IP, CONTROL_PORT))
-        except OSError as exc:
-            print(f"control UDP send failed: {exc}", flush=True)
+        for destination in control_destinations(self.pi_ip):
+            try:
+                self.control_socket.sendto(packet, destination)
+            except OSError as exc:
+                print(
+                    f"control UDP send to {destination[0]}:{destination[1]} "
+                    f"failed: {exc}",
+                    flush=True,
+                )
         self.control_sequence = (self.control_sequence + 1) & 0xFFFFFFFF
 
     def _show_link_details(self):
@@ -1386,7 +1396,7 @@ class MainWindow(QMainWindow):
                 print("AUTO-DISARMED: link lost", flush=True)
 
         if self.link_details.isVisible():
-            self.link_details.update_details(snapshot, PI_IP, self.pc_ip)
+            self.link_details.update_details(snapshot, self.pi_ip, self.pc_ip)
 
     def _fit_square_plots(self):
         for plot in (self.lidar_plot, self.uwb_plot):
@@ -1568,7 +1578,14 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="UWB / IMU / lidar dashboard.")
+    parser.add_argument(
+        "--pi-ip",
+        default=DEFAULT_PI_IP,
+        help=f"Raspberry Pi IP address (default: {DEFAULT_PI_IP})",
+    )
+    args = parser.parse_args()
+    app = QApplication([sys.argv[0]])
     pg.setConfigOption("background", PANEL)
     pg.setConfigOption("foreground", TEXT)
     app.setStyleSheet(
@@ -1654,7 +1671,7 @@ def main():
         QLabel#connectedStatus {{ color: {GREEN}; }}
         """
     )
-    window = MainWindow()
+    window = MainWindow(args.pi_ip)
     window.show()
     window.setFocus()
     return app.exec()

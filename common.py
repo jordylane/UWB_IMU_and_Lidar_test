@@ -13,7 +13,7 @@ PC_IP = "192.168.15.14"
 PI_IP = "192.168.15.16"
 UDP_PORT = 5005
 CONTROL_PORT = 5006
-CONTROL_MONITOR_PORT = CONTROL_PORT + 1
+CONTROL_MONITOR_PORT = 5007
 SEND_RATE_HZ = 20
 EXPECTED_RATE_HZ = SEND_RATE_HZ
 CONTROL_RATE_HZ = 20
@@ -40,6 +40,14 @@ _ANCHOR_COORDINATES = (
     [4.0, 0.0, 0.75],
 )
 anchors = np.array(_ANCHOR_COORDINATES) if np is not None else _ANCHOR_COORDINATES
+
+
+def control_destinations(pi_ip: str) -> tuple[tuple[str, int], ...]:
+    """Return UDP endpoints for Pi sensor control and control monitoring."""
+    return (
+        (pi_ip, CONTROL_PORT),
+        (pi_ip, CONTROL_MONITOR_PORT),
+    )
 
 
 def mix(keys: Collection[str]) -> tuple[float, float]:

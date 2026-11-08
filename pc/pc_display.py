@@ -18,11 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import (
     CONTROL_KEY_BITS,
-    CONTROL_PORT,
     CONTROL_RATE_HZ,
     PI_IP,
     UDP_PORT,
     anchors,
+    control_destinations,
     decode_packet,
     pack_control_packet,
 )
@@ -36,7 +36,7 @@ PRINT_EVERY = 10
 
 class ControlSender:
     def __init__(self, pi_ip):
-        self.address = (pi_ip, CONTROL_PORT)
+        self.addresses = control_destinations(pi_ip)
         self.lock = threading.Lock()
         self.keys = set()
         self.pending_states = deque()
@@ -88,12 +88,17 @@ class ControlSender:
                             oldest_sequence = next(iter(self.sent_timestamps))
                             del self.sent_timestamps[oldest_sequence]
                     packet = pack_control_packet(sequence, send_timestamp, keys)
-                    try:
-                        udp_socket.sendto(packet, self.address)
-                    except BlockingIOError:
-                        pass
-                    except OSError as exc:
-                        print(f"control UDP send failed: {exc}", flush=True)
+                    for address in self.addresses:
+                        try:
+                            udp_socket.sendto(packet, address)
+                        except BlockingIOError:
+                            pass
+                        except OSError as exc:
+                            print(
+                                f"control UDP send to {address[0]}:{address[1]} "
+                                f"failed: {exc}",
+                                flush=True,
+                            )
                     sequence = (sequence + 1) & 0xFFFFFFFF
                 if closing:
                     break

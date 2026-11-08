@@ -1,6 +1,6 @@
 import unittest
 
-from pc.pc_display_qt import LinkMonitor
+from pc_launch import LinkMonitor
 
 
 class LinkMonitorTests(unittest.TestCase):

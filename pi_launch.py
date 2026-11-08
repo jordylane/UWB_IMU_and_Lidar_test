@@ -1,94 +1,96 @@
+import os
+import shlex
+import shutil
 import subprocess
 import sys
-import threading
-import time
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-CHILDREN = (
-    ("control", ROOT / "pi" / "pi_control_monitor.py", ("--forwarded",)),
-    ("sensors", ROOT / "pi" / "pi_sensors.py", ()),
+TERMINALS = ("lxterminal", "x-terminal-emulator", "gnome-terminal", "xterm")
+WINDOWS = (
+    ("Pi Sensors", ROOT / "pi" / "pi_sensors.py"),
+    (
+        "Pi Control Monitor",
+        ROOT / "pi" / "pi_control_monitor.py",
+        ("--host", "0.0.0.0", "--port", "5007"),
+    ),
 )
-SHUTDOWN_TIMEOUT_SECONDS = 3.0
 
 
-def stream_output(name, process):
-    if process.stdout is None:
-        return
-    for line in process.stdout:
-        print(f"[{name}] {line}", end="", flush=True)
+def terminal_command(terminal, title, script, arguments=()):
+    script_command = shlex.join([sys.executable, str(script), *arguments])
+    shell_script = (
+        f"{script_command}; status=$?; "
+        'if [ "$status" -ne 0 ]; then '
+        "printf '\\nScript exited with status %s.\\n' \"$status\"; "
+        "read -r -p 'Press Enter to close this window...' _; "
+        "fi; exit \"$status\""
+    )
 
-
-def stop_processes(processes):
-    active = [process for process in processes if process.poll() is None]
-    for process in active:
-        process.terminate()
-
-    deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECONDS
-    for process in active:
-        remaining = max(0.0, deadline - time.monotonic())
-        try:
-            process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+    if terminal == "lxterminal":
+        command = f"bash -lc {shlex.quote(shell_script)}"
+        return [terminal, "--title", title, "--command", command]
+    if terminal == "x-terminal-emulator":
+        return [
+            terminal, "-T", title, "-e", "bash", "-lc", shell_script,
+        ]
+    if terminal == "gnome-terminal":
+        return [
+            terminal, "--title", title, "--", "bash", "-lc", shell_script,
+        ]
+    if terminal == "xterm":
+        return [terminal, "-T", title, "-e", "bash", "-lc", shell_script]
+    raise ValueError(f"Unsupported terminal emulator: {terminal}")
 
 
 def main():
-    for name, script, _ in CHILDREN:
+    if not os.environ.get("DISPLAY"):
+        print(
+            "Cannot open Raspberry Pi terminal windows: DISPLAY is not set. "
+            "Run this launcher from a graphical desktop session.",
+            file=sys.stderr,
+        )
+        return 1
+
+    terminal = next(
+        (name for name in TERMINALS if shutil.which(name)),
+        None,
+    )
+    if terminal is None:
+        print(
+            "Cannot open Raspberry Pi terminal windows: none of "
+            f"{', '.join(TERMINALS)} is installed.",
+            file=sys.stderr,
+        )
+        return 1
+
+    for window in WINDOWS:
+        title, script = window[:2]
         if not script.is_file():
-            print(f"[{name}] script not found: {script}", file=sys.stderr)
+            print(f"Cannot launch {title}: script not found: {script}",
+                  file=sys.stderr)
             return 1
 
     processes = []
-    output_threads = []
-    failed = False
     try:
-        for name, script, arguments in CHILDREN:
+        for window in WINDOWS:
+            title, script = window[:2]
+            arguments = window[2] if len(window) > 2 else ()
             process = subprocess.Popen(
-                [sys.executable, str(script), *arguments],
-                cwd=script.parent,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                terminal_command(terminal, title, script, arguments),
+                cwd=ROOT,
             )
             processes.append(process)
-            output_thread = threading.Thread(
-                target=stream_output,
-                args=(name, process),
-                name=f"{name}-output",
-            )
-            output_thread.start()
-            output_threads.append(output_thread)
-
-        while True:
-            exited = [
-                (name, process)
-                for (name, _, _), process in zip(CHILDREN, processes)
-                if process.poll() is not None
-            ]
-            if exited:
-                for name, process in exited:
-                    print(
-                        f"[{name}] exited with code {process.returncode}",
-                        flush=True,
-                    )
-                failed = any(process.returncode != 0 for _, process in exited)
-                break
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("Stopping child processes...", flush=True)
     except OSError as error:
-        print(f"Unable to start child process: {error}", file=sys.stderr)
-        failed = True
-    finally:
-        stop_processes(processes)
-        for output_thread in output_threads:
-            output_thread.join()
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        print(f"Cannot open Raspberry Pi terminal window: {error}",
+              file=sys.stderr)
+        return 1
 
-    return int(failed)
+    return 0
 
 
 if __name__ == "__main__":

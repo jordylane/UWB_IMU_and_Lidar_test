@@ -11,7 +11,13 @@ from matplotlib.patches import Circle
 import numpy as np
 from pynput import keyboard
 
-from common import PI_IP, CONTROL_RATE_HZ
+from common import (
+    CONTROL_MONITOR_PORT,
+    CONTROL_PORT,
+    CONTROL_RATE_HZ,
+    PI_IP,
+    pack_control_packet,
+)
 from kalman import (
     HeadingKalmanFilter,
     MAG_EXPECTED_FIELD,
@@ -1376,8 +1382,12 @@ def control_loop():
     held = set()
     enabled = False
     lock = threading.Lock()
-    keys = {keyboard.Key.left: b"L", keyboard.Key.right: b"R",
-            keyboard.Key.up: b"U", keyboard.Key.down: b"D"}
+    keys = {
+        keyboard.Key.left: "left",
+        keyboard.Key.right: "right",
+        keyboard.Key.up: "up",
+        keyboard.Key.down: "down",
+    }
     def on_press(key):
         nonlocal enabled
         if key == keyboard.Key.space:
@@ -1395,19 +1405,24 @@ def control_loop():
                 held.discard(key)
     listener = keyboard.Listener(on_press=on_press, on_release=on_release, daemon=True)
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sequence = 0
     last_command = ""
     print("control_loop ready: press SPACE to enable/disable")
     try:
         listener.start()
         while running:
             with lock:
-                commands = [value for key, value in keys.items() if enabled and key in held]
-            for command in commands:
+                commands = {
+                    value for key, value in keys.items() if enabled and key in held
+                }
+            packet = pack_control_packet(sequence, time.perf_counter(), commands)
+            for port in (CONTROL_PORT, CONTROL_MONITOR_PORT):
                 try:
-                    udp_socket.sendto(command, (PI_IP, CONTROL_PORT))
+                    udp_socket.sendto(packet, (PI_IP, port))
                 except OSError:
                     pass
-            command_string = "+".join(command.decode() for command in commands)
+            sequence = (sequence + 1) & 0xFFFFFFFF
+            command_string = "+".join(sorted(commands))
             if command_string != last_command:
                 print(command_string if command_string else "released")
                 last_command = command_string

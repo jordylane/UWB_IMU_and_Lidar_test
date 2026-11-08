@@ -7,21 +7,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import (
-    CONTROL_MONITOR_PORT,
-    CONTROL_PORT,
     CONTROL_RATE_HZ,
     CONTROL_TIMEOUT_SECONDS,
     mix,
     unpack_control_packet,
 )
 
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 5007
 HEARTBEAT_SECONDS = 1.0
-KEY_ORDER = ("up", "down", "left", "right", "g_up", "g_down")
+KEY_ORDER = (
+    "up", "down", "left", "right",
+    "grabber_up", "grabber_down", "claw_open", "claw_close",
+)
 
 
 def print_status(start, sequence, keys, age_ms):
     names = "+".join(key.upper() for key in KEY_ORDER if key in keys) or "NONE"
-    left, right = mix(keys)
+    drive_keys = keys & {"up", "down", "left", "right"}
+    left, right = mix(drive_keys)
     print(
         f"[{time.perf_counter() - start:.3f}] seq={sequence} keys={names} "
         f"left={left:.2f} right={right:.2f} age={age_ms:.1f}ms",
@@ -29,19 +33,22 @@ def print_status(start, sequence, keys, age_ms):
     )
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Monitor PC vehicle-control packets.")
     parser.add_argument("--all", action="store_true", help="Print every valid packet.")
     parser.add_argument(
-        "--forwarded",
-        action="store_true",
-        help="Listen for packets forwarded by pi_sensors.",
+        "--host",
+        default=DEFAULT_HOST,
+        help=f"UDP bind address (default: {DEFAULT_HOST})",
     )
-    args = parser.parse_args()
-    listen_address = (
-        ("127.0.0.1", CONTROL_MONITOR_PORT)
-        if args.forwarded else ("0.0.0.0", CONTROL_PORT)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"UDP bind port (default: {DEFAULT_PORT})",
     )
+    args = parser.parse_args(argv)
+    listen_address = (args.host, args.port)
     start = time.perf_counter()
     last_packet_time = None
     last_print_time = 0.0
@@ -58,12 +65,13 @@ def main():
             # SO_REUSEADDR/SO_REUSEPORT; UDP may still deliver to only one socket
             # unless multicast/broadcast is used.
             print(
-                f"Cannot bind UDP {CONTROL_PORT}: {exc}. Stop the main Pi script "
+                f"Cannot bind UDP {args.host}:{args.port}: {exc}. "
+                "Stop any other process using this address "
                 "for testing, or configure socket reuse (UDP packet delivery "
                 "may be exclusive).",
                 flush=True,
             )
-            return
+            return 1
 
         control_socket.settimeout(0.05)
         print(
@@ -134,4 +142,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
