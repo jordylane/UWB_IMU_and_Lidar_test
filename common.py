@@ -14,6 +14,10 @@ PI_IP = "192.168.15.16"
 UDP_PORT = 5005
 CONTROL_PORT = 5006
 CONTROL_MONITOR_PORT = 5007
+HELLO_MAGIC = b"\x00UWB-HELLO\xff"
+ACK_MAGIC = b"\x00UWB-ACK\xff"
+HELLO_PAYLOAD = b"CONNECTION OK"
+ACK_PAYLOAD = b"CONNECTION ACK"
 SEND_RATE_HZ = 20
 EXPECTED_RATE_HZ = SEND_RATE_HZ
 CONTROL_RATE_HZ = 20
@@ -40,6 +44,22 @@ _ANCHOR_COORDINATES = (
     [4.0, 0.0, 0.75],
 )
 anchors = np.array(_ANCHOR_COORDINATES) if np is not None else _ANCHOR_COORDINATES
+
+
+def make_hello_packet() -> bytes:
+    return HELLO_MAGIC + HELLO_PAYLOAD
+
+
+def is_hello_packet(data: bytes) -> bool:
+    return data == make_hello_packet()
+
+
+def make_ack_packet() -> bytes:
+    return ACK_MAGIC + ACK_PAYLOAD
+
+
+def is_ack_packet(data: bytes) -> bool:
+    return data == make_ack_packet()
 
 
 def control_destinations(pi_ip: str) -> tuple[tuple[str, int], ...]:

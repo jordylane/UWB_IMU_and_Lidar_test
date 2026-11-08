@@ -51,6 +51,7 @@ from common import (
     pack_control_packet,
 )
 from pc.controller_input import controller_commands
+from pc.control_connection import ControlHandshake
 
 DEFAULT_PI_IP = PI_IP
 PRINT_EVERY = 10
@@ -819,6 +820,7 @@ class MainWindow(QMainWindow):
         self.estop_active = False
         self.last_command = ""
         self.control_sequence = 0
+        self.connection_generation = 0
         self.pi_ip = pi_ip
         self.raw_x = []
         self.raw_y = []
@@ -837,6 +839,11 @@ class MainWindow(QMainWindow):
         self.receiver_socket.bind(("0.0.0.0", UDP_PORT))
         self.receiver_socket.settimeout(0.25)
         self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.handshake = ControlHandshake(
+            self.control_socket,
+            self.pi_ip,
+            self._update_connection_status,
+        )
 
         self._build_ui()
         QApplication.instance().installEventFilter(self)
@@ -999,6 +1006,11 @@ class MainWindow(QMainWindow):
         self.command_label = QLabel("Command: idle")
         self.command_label.setObjectName("mutedText")
         status_block.addWidget(self.command_label, 0, Qt.AlignmentFlag.AlignRight)
+        self.connection_status_label = QLabel("Connecting")
+        self.connection_status_label.setObjectName("connectionStatus")
+        status_block.addWidget(
+            self.connection_status_label, 0, Qt.AlignmentFlag.AlignRight
+        )
         top_bar.addLayout(status_block, 0)
         root.addWidget(top_section, 0)
 
@@ -1239,6 +1251,12 @@ class MainWindow(QMainWindow):
             self._send_control_state()
 
     def send_held_commands(self):
+        connected = self.handshake.poll()
+        if connected and self.handshake.generation != self.connection_generation:
+            self.connection_generation = self.handshake.generation
+            self.control_sequence = 0
+        if not connected:
+            return
         if self.estop_active:
             self._send_control_state()
             return
@@ -1247,6 +1265,8 @@ class MainWindow(QMainWindow):
         self._send_control_state()
 
     def _send_control_state(self):
+        if not self.handshake.connected:
+            return
         keys = set()
         if not self.estop_active:
             keys = {
@@ -1273,6 +1293,17 @@ class MainWindow(QMainWindow):
         self.link_details.show()
         self.link_details.raise_()
         self.update_dashboard()
+
+    def _update_connection_status(self, state, _message):
+        self.connection_status_label.setText(state)
+        colors = {
+            "Connecting": AMBER,
+            "Connected": GREEN,
+            "Failed": RED,
+        }
+        self.connection_status_label.setStyleSheet(
+            f"color: {colors[state]};"
+        )
 
     def _update_link_health(self, snapshot):
         state = snapshot["state"]
@@ -1668,6 +1699,7 @@ def main():
         }}
         QStatusBar::item {{ border: none; padding: 0 10px; }}
         QLabel#waitingStatus {{ color: {MUTED}; }}
+        QLabel#connectionStatus {{ font-weight: bold; }}
         QLabel#connectedStatus {{ color: {GREEN}; }}
         """
     )

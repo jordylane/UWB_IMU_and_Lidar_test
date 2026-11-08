@@ -9,6 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import (
     CONTROL_RATE_HZ,
     CONTROL_TIMEOUT_SECONDS,
+    is_hello_packet,
+    make_ack_packet,
     mix,
     unpack_control_packet,
 )
@@ -54,8 +56,9 @@ def main(argv=None):
     last_print_time = 0.0
     last_keys = None
     last_sequence = None
-    received = dropped = missing = 0
+    received = dropped = missing = hellos = 0
     signal_lost = False
+    hello_senders = set()
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control_socket:
         try:
@@ -81,7 +84,7 @@ def main(argv=None):
         try:
             while True:
                 try:
-                    packet, _ = control_socket.recvfrom(1024)
+                    packet, sender_address = control_socket.recvfrom(1024)
                 except socket.timeout:
                     now = time.perf_counter()
                     reference = last_packet_time if last_packet_time is not None else start
@@ -99,6 +102,32 @@ def main(argv=None):
                     continue
 
                 now = time.perf_counter()
+                if is_hello_packet(packet):
+                    hellos += 1
+                    sender_seen = sender_address in hello_senders
+                    was_signal_lost = signal_lost
+                    hello_senders.add(sender_address)
+                    last_sequence = None
+                    last_packet_time = now
+                    signal_lost = False
+                    if not sender_seen or was_signal_lost:
+                        print(
+                            f"[{now - start:.3f}] CONNECTION OK from "
+                            f"{sender_address[0]}:{sender_address[1]}",
+                            flush=True,
+                        )
+                    try:
+                        control_socket.sendto(
+                            make_ack_packet(), sender_address
+                        )
+                    except OSError as exc:
+                        print(
+                            f"Cannot send CONNECTION ACK to "
+                            f"{sender_address[0]}:{sender_address[1]}: {exc}",
+                            flush=True,
+                        )
+                    continue
+
                 received += 1
                 try:
                     sequence, _, keys = unpack_control_packet(packet)
@@ -138,7 +167,8 @@ def main(argv=None):
             elapsed = time.perf_counter() - start
             rate = received / elapsed if elapsed else 0.0
             print(f"Stopped: received={received} dropped={dropped} "
-                  f"missing={missing} average_rate={rate:.2f} packets/s")
+                  f"missing={missing} hellos={hellos} "
+                  f"average_rate={rate:.2f} packets/s")
 
 
 if __name__ == "__main__":

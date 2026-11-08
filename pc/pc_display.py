@@ -26,6 +26,7 @@ from common import (
     decode_packet,
     pack_control_packet,
 )
+from pc.control_connection import ControlHandshake
 
 PLOT_MAX_RANGE = 4.0
 PLOT_AUTO_RANGE = False
@@ -62,24 +63,36 @@ class ControlSender:
         sequence = 0
         next_send = time.perf_counter()
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
-            udp_socket.setblocking(False)
+            handshake = ControlHandshake(udp_socket, self.addresses[0][0])
+            connection_generation = 0
             while True:
                 timeout = max(0.0, next_send - time.perf_counter())
                 self.wake.wait(timeout)
                 self.wake.clear()
 
                 timestamp = time.perf_counter()
+                connected = handshake.poll(timestamp)
                 with self.lock:
                     pending_states = list(self.pending_states)
                     self.pending_states.clear()
                     current_keys = self.keys.copy()
                     closing = self.closing
 
-                states_to_send = pending_states
-                if timestamp >= next_send or (closing and not states_to_send):
-                    if not states_to_send or states_to_send[-1] != current_keys:
-                        states_to_send.append(current_keys)
+                if connected:
+                    if handshake.generation != connection_generation:
+                        connection_generation = handshake.generation
+                        sequence = 0
+                        pending_states.clear()
+                    states_to_send = pending_states
+                    if timestamp >= next_send or (closing and not states_to_send):
+                        if not states_to_send or states_to_send[-1] != current_keys:
+                            states_to_send.append(current_keys)
+                        next_send = timestamp + interval
+                else:
+                    states_to_send = []
+                    pending_states.clear()
                     next_send = timestamp + interval
+
                 for keys in states_to_send:
                     send_timestamp = time.perf_counter()
                     with self.lock:

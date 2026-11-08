@@ -18,6 +18,7 @@ from common import (
     PI_IP,
     pack_control_packet,
 )
+from pc.control_connection import ControlHandshake
 from kalman import (
     HeadingKalmanFilter,
     MAG_EXPECTED_FIELD,
@@ -1405,23 +1406,36 @@ def control_loop():
                 held.discard(key)
     listener = keyboard.Listener(on_press=on_press, on_release=on_release, daemon=True)
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    handshake = ControlHandshake(udp_socket, PI_IP)
     sequence = 0
+    connection_generation = 0
     last_command = ""
     print("control_loop ready: press SPACE to enable/disable")
     try:
         listener.start()
         while running:
+            connected = handshake.poll()
+            if connected and handshake.generation != connection_generation:
+                connection_generation = handshake.generation
+                sequence = 0
             with lock:
                 commands = {
                     value for key, value in keys.items() if enabled and key in held
                 }
-            packet = pack_control_packet(sequence, time.perf_counter(), commands)
-            for port in (CONTROL_PORT, CONTROL_MONITOR_PORT):
-                try:
-                    udp_socket.sendto(packet, (PI_IP, port))
-                except OSError:
-                    pass
-            sequence = (sequence + 1) & 0xFFFFFFFF
+            if connected:
+                packet = pack_control_packet(
+                    sequence, time.perf_counter(), commands
+                )
+                for port in (CONTROL_PORT, CONTROL_MONITOR_PORT):
+                    try:
+                        udp_socket.sendto(packet, (PI_IP, port))
+                    except OSError as error:
+                        print(
+                            f"control UDP send to {PI_IP}:{port} failed: "
+                            f"{error}",
+                            flush=True,
+                        )
+                sequence = (sequence + 1) & 0xFFFFFFFF
             command_string = "+".join(sorted(commands))
             if command_string != last_command:
                 print(command_string if command_string else "released")

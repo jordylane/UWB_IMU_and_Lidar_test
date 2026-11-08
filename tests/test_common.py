@@ -2,8 +2,14 @@ import struct
 import unittest
 
 from common import (
+    ACK_MAGIC,
     CONTROL_PACKET_FORMAT,
+    HELLO_MAGIC,
     control_destinations,
+    is_ack_packet,
+    is_hello_packet,
+    make_ack_packet,
+    make_hello_packet,
     mix,
     unpack_control_packet,
 )
@@ -59,6 +65,22 @@ class ControlPacketTests(unittest.TestCase):
             control_destinations("192.0.2.10"),
             (("192.0.2.10", 5006), ("192.0.2.10", 5007)),
         )
+
+    def test_hello_and_ack_packets_are_distinct_from_control_packets(self):
+        hello = make_hello_packet()
+        ack = make_ack_packet()
+        control = struct.pack(CONTROL_PACKET_FORMAT, 1, 1.0, 0)
+
+        self.assertEqual(hello, HELLO_MAGIC + b"CONNECTION OK")
+        self.assertEqual(ack, ACK_MAGIC + b"CONNECTION ACK")
+        self.assertTrue(is_hello_packet(hello))
+        self.assertTrue(is_ack_packet(ack))
+        self.assertFalse(is_hello_packet(ack))
+        self.assertFalse(is_hello_packet(control))
+        self.assertFalse(is_ack_packet(hello))
+        self.assertFalse(is_ack_packet(control))
+        with self.assertRaises(ValueError):
+            unpack_control_packet(hello)
 
 
 if __name__ == "__main__":
