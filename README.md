@@ -15,22 +15,23 @@ for UDP control packets on `0.0.0.0:5007` by default; override this with its
 `--host` and `--port` options when running it directly.
 
 The sensor process reads the lidar live from `/dev/serial0` at 230400 baud by
-default and records the received bytes in `pi/lidar_capture.bin`. UWB and IMU
-remain in their existing playback mode unless live mode is enabled in
-`pi/pi_sensors.py`. To replay a lidar capture instead, run
-`python pi/pi_sensors.py --replay-lidar`. Use `--lidar-port` to select a
-different serial device.
+default, reads UWB live from `/dev/ttyUSB0`, and reads IMU data from the Sense
+HAT. It records incoming sensor data under `pi/`, but does not replay those
+recordings. Use `--lidar-port` to select a different LiDAR serial device.
 
 Before starting the Pi software:
 
 1. In `sudo raspi-config`, open **Interface Options > Serial Port**, disable
-   the serial login shell, enable the serial hardware, and reboot.
+   the serial login shell, and enable the serial hardware. On Raspberry Pi 5,
+   add `dtoverlay=uart0-pi5` to `/boot/firmware/config.txt` to route UART0 to
+   the GPIO header pins 8 and 10; then reboot.
 2. Ensure the Pi user can access serial devices. If needed, run
    `sudo usermod -aG dialout "$USER"` and log out and back in.
-3. Connect the lidar's UART TX to Pi pin 10 (GPIO15/RXD), UART RX to Pi pin 8
-   (GPIO14/TXD) if the lidar needs a return channel, and connect ground to
-   ground. Use 3.3 V UART logic; do not apply 5 V logic to the Pi GPIO pins.
-4. Confirm `/dev/serial0` exists, then run `python pi_launch.py`.
+3. Connect the lidar's UART TX to Pi pin 10 (GPIO15/RXD). If the lidar needs
+   a return channel, connect its UART RX to Pi pin 8 (GPIO14/TXD); pin 12 is
+   GPIO18, not UART TX. Connect ground to ground and use 3.3 V UART logic.
+4. Confirm `/dev/serial0` exists, connect the UWB device over USB as
+   `/dev/ttyUSB0`, then run `python pi_launch.py`.
 
 ## Windows PC
 

@@ -38,8 +38,7 @@ from kalman import (
     wrap_angle,
 )
 
-USE_LIVE_DATA = False
-USE_LIVE_LIDAR = True
+USE_LIVE_DATA = True
 PRINT_EVERY = 10
 MAX_SIMULATION_DT = 0.1
 
@@ -55,10 +54,6 @@ def read_wifi_rssi_dbm():
     except Exception:
         return None
     return None
-
-
-if USE_LIVE_DATA:
-    from sense_hat import SenseHat
 
 
 class ControlReceiver:
@@ -402,6 +397,8 @@ class LiveAccSource:
 
     def __init__(self, record_filename=None):
 
+        from sense_hat import SenseHat
+
         self.sense = SenseHat()
         self.record_file = None
 
@@ -465,6 +462,8 @@ class FileAccSource:
 class LiveAttSource:
 
     def __init__(self, record_filename=None):
+
+        from sense_hat import SenseHat
 
         self.sense = SenseHat()
         self.start_time = None
@@ -781,7 +780,7 @@ def lidar_loop():
 # Choose source
 # --------------------------------------------------
 
-    if USE_LIVE_LIDAR:
+    if USE_LIVE_DATA:
         source = SerialLidarSource(
             SERIAL_PORT, record_filename=DATA_DIR / "lidar_capture.bin"
         )
@@ -1328,7 +1327,7 @@ def sender_loop(pc_ip, control_receiver=None, vehicle=None):
 # --------------------------------------------------
 
 def main():
-    global running, DATA_DIR, SERIAL_PORT, USE_LIVE_LIDAR
+    global running, DATA_DIR, SERIAL_PORT
 
     parser = argparse.ArgumentParser(description="Send UWB, IMU, and lidar data over UDP")
     parser.add_argument("--pc-ip", default=PC_IP, help="IP address of the PC display")
@@ -1338,42 +1337,18 @@ def main():
         help="serial device used by the live lidar (default: /dev/serial0)",
     )
     parser.add_argument(
-        "--replay-lidar",
-        action="store_false",
-        dest="use_live_lidar",
-        help="read lidar_capture.bin instead of the live serial lidar",
-    )
-    parser.add_argument(
         "--data-dir",
         type=Path,
         default=DATA_DIR,
         help=f"directory containing sensor data files (default: {DATA_DIR})",
     )
-    parser.set_defaults(use_live_lidar=USE_LIVE_LIDAR)
     args = parser.parse_args()
     DATA_DIR = args.data_dir.expanduser().resolve()
     SERIAL_PORT = args.lidar_port
-    USE_LIVE_LIDAR = args.use_live_lidar
     print(f"Sensor data directory: {DATA_DIR}", flush=True)
-    if USE_LIVE_LIDAR:
-        print(f"Reading live lidar from {SERIAL_PORT} at 230400 baud", flush=True)
+    print(f"Reading live lidar from {SERIAL_PORT} at 230400 baud", flush=True)
 
-    if not USE_LIVE_DATA:
-        required_files = (
-            "uwb_capture.txt",
-            "accelerometer_capture.csv",
-            "attitude_capture.csv",
-        )
-        if not USE_LIVE_LIDAR:
-            required_files += ("lidar_capture.bin",)
-        for filename in required_files:
-            path = DATA_DIR / filename
-            if not path.is_file():
-                raise FileNotFoundError(
-                    f"Required sensor data file not found: {path}"
-                )
-
-    control_receiver = ControlReceiver(shared) if USE_LIVE_DATA else None
+    control_receiver = ControlReceiver(shared)
     vehicle = VehicleSimulation()
     threads = [
         threading.Thread(target=lidar_loop),

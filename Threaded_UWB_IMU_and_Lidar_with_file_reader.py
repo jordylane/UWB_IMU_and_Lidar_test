@@ -484,7 +484,7 @@ distances = [0, 0, 0, 0]
 # Lidar System Constants
 # ----------------------------------------------------------------------
 # Serial port of the LIDAR unit
-SERIAL_PORT = "/dev/ttyAMA0"
+SERIAL_PORT = "/dev/serial0"
 
 # At the default rotation speed (~3600 deg/s) the system outputs about 
 # 480 measurements in a full rotation. We want to plot at least this
