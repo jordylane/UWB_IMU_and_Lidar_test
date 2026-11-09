@@ -29,7 +29,7 @@ from kalman import (
     wrap_angle,
 )
 
-USE_LIVE_DATA = False
+USE_LIVE_DATA = True
 DATA_DIR = Path(__file__).resolve().parent / "pi"
 
 if USE_LIVE_DATA:
