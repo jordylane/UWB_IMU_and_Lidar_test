@@ -484,7 +484,7 @@ distances = [0, 0, 0, 0]
 # Lidar System Constants
 # ----------------------------------------------------------------------
 # Serial port of the LIDAR unit
-SERIAL_PORT = "/dev/serial0"
+SERIAL_PORT = "/dev/ttyAMA0"
 
 # At the default rotation speed (~3600 deg/s) the system outputs about 
 # 480 measurements in a full rotation. We want to plot at least this
@@ -658,7 +658,7 @@ def lidar_loop():
             
             data = source.read(size=PACKET_LENGTH)
             
-            if data[0] != 0x54 or len(data) != PACKET_LENGTH:
+            if len(data) != PACKET_LENGTH or data[0] != 0x54:
                 print("WARNING: Serial sync lost")
                 state = State.SYNC0
                 continue
