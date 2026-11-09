@@ -1,4 +1,6 @@
 import argparse
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -44,6 +46,22 @@ def process_commands(pc_ip, lidar_port, data_dir):
     )
 
 
+def _raise_interrupt(signum, frame):
+    # Route SIGTERM/SIGHUP through the same cleanup path as Ctrl+C.
+    raise KeyboardInterrupt
+
+
+def udp_port_in_use(port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("0.0.0.0", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        sock.close()
+
+
 def stop_processes(processes):
     for _, process in processes:
         if process.poll() is None:
@@ -66,6 +84,9 @@ def stop_processes(processes):
 
 
 def run_processes(commands):
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _raise_interrupt)
+
     processes = []
     try:
         for name, command in commands:
@@ -102,9 +123,7 @@ def main(argv=None):
     parser.add_argument(
         "--pc-ip",
         required=True,
-        help=(
-            "PC address reachable from the Pi for sensor UDP packets"
-        ),
+        help="PC address reachable from the Pi for sensor UDP packets",
     )
     parser.add_argument(
         "--lidar-port",
@@ -124,9 +143,19 @@ def main(argv=None):
         ("Pi Sensors", SENSOR_SCRIPT),
     ):
         if not script.is_file():
-            print(f"Cannot launch {name}: script not found: {script}",
-                  file=sys.stderr)
+            print(
+                f"Cannot launch {name}: script not found: {script}",
+                file=sys.stderr,
+            )
             return 1
+
+    if udp_port_in_use(CONTROL_MONITOR_PORT):
+        print(
+            f"UDP port {CONTROL_MONITOR_PORT} is already in use. "
+            f"Find it with: sudo ss -ulpn | grep {CONTROL_MONITOR_PORT}",
+            file=sys.stderr,
+        )
+        return 1
 
     return run_processes(
         process_commands(
