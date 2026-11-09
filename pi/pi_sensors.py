@@ -475,7 +475,9 @@ class LiveAttSource:
             self.record_file.write(
                 "raw_mag_heading_deg,roll_rad,pitch_rad,yaw_rad,elapsed_s,"
                 "mag_x_uT,mag_y_uT,mag_z_uT,accel_x_g,accel_y_g,accel_z_g,"
-                "gyro_z_rad_s,gyro_heading_deg,kalman_heading_deg,gyro_bias_deg_s\n"
+                "gyro_z_rad_s,gyro_heading_deg,kalman_heading_deg,gyro_bias_deg_s,"
+                "gyro_x_rad_s,gyro_y_rad_s,orientation_roll_rad,"
+                "orientation_pitch_rad\n"
             )
 
     def get_data(self):
@@ -486,11 +488,19 @@ class LiveAttSource:
         gyro = self.sense.get_gyroscope_raw()
         mag = self.sense.get_compass_raw()
         attitude = self.sense.get_orientation_radians()
+        gyro_xyz = (gyro["x"], gyro["y"], gyro["z"])
+        orientation_rpy = (
+            attitude["roll"],
+            attitude["pitch"],
+            attitude["yaw"],
+        )
 
         return {
             "mag_xyz": (mag["x"], mag["y"], mag["z"]),
             "accel_xyz": (accel["x"], accel["y"], accel["z"]),
+            "gyro_xyz": gyro_xyz,
             "gyro_z": gyro["z"],
+            "orientation_rpy": orientation_rpy,
             "yaw": attitude["yaw"],
             "elapsed": sample_timestamp - self.start_time,
         }
@@ -499,13 +509,16 @@ class LiveAttSource:
         if self.record_file:
             mx, my, mz = sample["mag_xyz"]
             ax, ay, az = sample["accel_xyz"]
+            roll_sense, pitch_sense = sample["orientation_rpy"][:2]
+            gx, gy = sample["gyro_xyz"][:2]
             self.record_file.write(
                 f"{math.degrees(raw_heading):.4f},{roll:.6f},{pitch:.6f},"
                 f"{sample['yaw']:.6f},{sample['elapsed']:.6f},"
                 f"{mx:.5f},{my:.5f},{mz:.5f},{ax:.5f},{ay:.5f},{az:.5f},"
                 f"{sample['gyro_z']:.6f},{math.degrees(gyro_heading):.4f},"
                 f"{math.degrees(kalman_heading):.4f},"
-                f"{math.degrees(bias):.4f}\n"
+                f"{math.degrees(bias):.4f},{gx:.6f},{gy:.6f},"
+                f"{roll_sense:.6f},{pitch_sense:.6f}\n"
             )
             self.record_file.flush()
     
@@ -546,6 +559,16 @@ class FileAttSource:
                 "mag_xyz": tuple(values[5:8]),
                 "accel_xyz": tuple(values[8:11]),
                 "gyro_z": values[11],
+                "gyro_xyz": (
+                    (values[15], values[16], values[11])
+                    if len(values) >= 17
+                    else (0.0, 0.0, values[11])
+                ),
+                "orientation_rpy": (
+                    (values[17], values[18], values[3])
+                    if len(values) >= 19
+                    else (values[1], values[2], values[3])
+                ),
                 "yaw": values[3],
                 "elapsed": values[4],
             }
@@ -555,6 +578,8 @@ class FileAttSource:
                 "mag_xyz": None,
                 "accel_xyz": None,
                 "gyro_z": None,
+                "gyro_xyz": None,
+                "orientation_rpy": None,
                 "yaw": yaw,
                 "elapsed": elapsed,
                 "legacy_heading": math.radians(heading),
@@ -590,6 +615,10 @@ class SharedData:
         self.ax_buffer = deque(maxlen=100)
         self.ay_buffer = deque(maxlen=100)
         self.accel_xyz = (0.0, 0.0, 1.0)
+        self.imu_accel_xyz = (0.0, 0.0, 1.0)
+        self.imu_gyro_xyz = (0.0, 0.0, 0.0)
+        self.imu_mag_xyz = (0.0, 0.0, 0.0)
+        self.imu_orientation_rpy = (0.0, 0.0, 0.0)
 
         self.uwb_x = 0.0
         self.uwb_y = 0.0
@@ -1207,6 +1236,13 @@ def attitude_loop():
             shared.roll = roll
             shared.pitch = pitch
             shared.yaw = yaw
+            shared.imu_accel_xyz = sample["accel_xyz"] or replay_accel_xyz
+            if sample["gyro_xyz"] is not None:
+                shared.imu_gyro_xyz = sample["gyro_xyz"]
+            if sample["mag_xyz"] is not None:
+                shared.imu_mag_xyz = sample["mag_xyz"]
+            if sample["orientation_rpy"] is not None:
+                shared.imu_orientation_rpy = sample["orientation_rpy"]
 
         now = time.perf_counter()
         dt = now - start_time
@@ -1286,6 +1322,16 @@ def sender_loop(pc_ip, control_receiver=None, vehicle=None):
                     "distances": shared.distances.copy(),
                     "ax": shared.ax_buffer[-1] if shared.ax_buffer else 0.0,
                     "ay": shared.ay_buffer[-1] if shared.ay_buffer else 0.0,
+                    "imu": {
+                        "accelerometer_g": list(shared.imu_accel_xyz),
+                        "gyroscope_rad_s": list(shared.imu_gyro_xyz),
+                        "magnetometer_uT": list(shared.imu_mag_xyz),
+                        "orientation_rad": {
+                            "roll": shared.imu_orientation_rpy[0],
+                            "pitch": shared.imu_orientation_rpy[1],
+                            "yaw": shared.imu_orientation_rpy[2],
+                        },
+                    },
                     "heading": shared.heading,
                     "raw_heading": shared.raw_heading,
                     "gyro_heading": shared.gyro_heading,
@@ -1305,11 +1351,28 @@ def sender_loop(pc_ip, control_receiver=None, vehicle=None):
             if packet_count % PRINT_EVERY == 0:
                 distances = ", ".join(f"{value:.2f}" for value in packet["distances"])
                 age = time.time() - packet["timestamp"]
+                imu = packet["imu"]
+                accel_text = ", ".join(
+                    f"{value:+.3f}" for value in imu["accelerometer_g"]
+                )
+                gyro_text = ", ".join(
+                    f"{value:+.3f}" for value in imu["gyroscope_rad_s"]
+                )
+                mag_text = ", ".join(
+                    f"{value:+.1f}" for value in imu["magnetometer_uT"]
+                )
+                orientation = imu["orientation_rad"]
                 print(
                     f"#{packet_count} {len(payload)} B lidar={len(packet['lidar_x'])} "
                     f"uwb=({packet['uwb_x']:.2f}, {packet['uwb_y']:.2f}) "
-                    f"distances=[{distances}] ax/ay=({packet['ax']:.3f}, "
-                    f"{packet['ay']:.3f}) heading={packet['heading']:.1f} "
+                    f"distances=[{distances}] "
+                    f"imu_accel_g=[{accel_text}] "
+                    f"imu_gyro_rad_s=[{gyro_text}] "
+                    f"imu_mag_uT=[{mag_text}] "
+                    f"imu_rpy_rad=({orientation['roll']:+.3f},"
+                    f"{orientation['pitch']:+.3f},"
+                    f"{orientation['yaw']:+.3f}) "
+                    f"heading={packet['heading']:.1f} "
                     f"yaw={packet['yaw']:.1f} age={age:.3f}s",
                     flush=True,
                 )

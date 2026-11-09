@@ -63,6 +63,7 @@ from common import (
 )
 from pc.controller_input import controller_commands
 from pc.control_connection import ControlHandshake
+from pc.imu import format_imu_reading, parse_imu_payload
 
 DEFAULT_PI_IP = PI_IP
 CAMERA_STREAM_URL = "http://192.168.137.115:5000"
@@ -301,6 +302,8 @@ class DisplayData:
         self.lidar_c = np.array([])
         self.ax_buffer = deque(maxlen=100)
         self.ay_buffer = deque(maxlen=100)
+        self.az_buffer = deque(maxlen=100)
+        self.imu_reading = None
         self.uwb_x = 0.0
         self.uwb_y = 0.0
         self.distances = [0.0] * 4
@@ -348,6 +351,7 @@ def receiver_loop(shared_data, stop_event, udp_socket):
             lidar_y = np.asarray(packet["lidar_y"])
             lidar_c = np.asarray(packet["lidar_c"])
             distances = list(packet["distances"])
+            imu_reading = parse_imu_payload(packet.get("imu"))
             seq = packet.get("seq")
             rssi_dbm = packet.get("rssi_dbm")
             with shared_data.lock:
@@ -355,8 +359,16 @@ def receiver_loop(shared_data, stop_event, udp_socket):
                 shared_data.lidar_x = lidar_x
                 shared_data.lidar_y = lidar_y
                 shared_data.lidar_c = lidar_c
-                shared_data.ax_buffer.append(float(packet["ax"]))
-                shared_data.ay_buffer.append(float(packet["ay"]))
+                shared_data.imu_reading = imu_reading
+                if imu_reading is None:
+                    shared_data.ax_buffer.append(float(packet["ax"]))
+                    shared_data.ay_buffer.append(float(packet["ay"]))
+                    shared_data.az_buffer.append(float("nan"))
+                else:
+                    accel_x, accel_y, accel_z = imu_reading.accelerometer_g
+                    shared_data.ax_buffer.append(accel_x)
+                    shared_data.ay_buffer.append(accel_y)
+                    shared_data.az_buffer.append(accel_z)
                 shared_data.uwb_x = float(packet["uwb_x"])
                 shared_data.uwb_y = float(packet["uwb_y"])
                 shared_data.distances = distances
@@ -1013,25 +1025,32 @@ class MainWindow(QMainWindow):
 
         acceleration_panel = QFrame()
         acceleration_panel.setObjectName("panel")
-        acceleration_panel.setFixedWidth(300)
+        acceleration_panel.setFixedWidth(370)
         acceleration_layout = QVBoxLayout(acceleration_panel)
         acceleration_layout.setContentsMargins(8, 4, 8, 6)
         acceleration_layout.setSpacing(2)
-        acceleration_title = QLabel("Acceleration")
+        acceleration_title = QLabel("Sense HAT IMU")
         acceleration_title.setObjectName("panelTitle")
         acceleration_layout.addWidget(acceleration_title)
+        self.imu_values_label = QLabel("Waiting for IMU telemetry")
+        self.imu_values_label.setObjectName("imuValues")
+        acceleration_layout.addWidget(self.imu_values_label)
         self.acceleration_plot = pg.PlotWidget()
         self.acceleration_plot.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.acceleration_plot.setBackground(PANEL)
         self.acceleration_plot.showGrid(x=True, y=True, alpha=0.25)
         self.acceleration_plot.setLabel("bottom", "Sample")
+        self.acceleration_plot.setLabel("left", "Acceleration", units="g")
         self.acceleration_plot.setYRange(-2, 2, padding=0)
         self.acceleration_plot.addLegend()
         self.acceleration_x_line = self.acceleration_plot.plot(
-            [], [], pen=pg.mkPen(BLUE, width=1.5), name="x acceleration"
+            [], [], pen=pg.mkPen(BLUE, width=1.5), name="X"
         )
         self.acceleration_y_line = self.acceleration_plot.plot(
-            [], [], pen=pg.mkPen(RED, width=1.5), name="y acceleration"
+            [], [], pen=pg.mkPen(RED, width=1.5), name="Y"
+        )
+        self.acceleration_z_line = self.acceleration_plot.plot(
+            [], [], pen=pg.mkPen(GREEN, width=1.5), name="Z"
         )
         acceleration_layout.addWidget(self.acceleration_plot, 1)
         top_bar.addWidget(acceleration_panel, 0)
@@ -1564,6 +1583,8 @@ class MainWindow(QMainWindow):
             distances = self.shared_data.distances.copy()
             ax_buffer = list(self.shared_data.ax_buffer)
             ay_buffer = list(self.shared_data.ay_buffer)
+            az_buffer = list(self.shared_data.az_buffer)
+            imu_reading = self.shared_data.imu_reading
             uwb_x = self.shared_data.uwb_x
             uwb_y = self.shared_data.uwb_y
             heading = self.shared_data.heading
@@ -1592,7 +1613,11 @@ class MainWindow(QMainWindow):
         self.acceleration_y_line.setData(
             np.arange(len(ay_buffer)), ay_buffer
         )
-        sample_count = max(len(ax_buffer), len(ay_buffer))
+        self.acceleration_z_line.setData(
+            np.arange(len(az_buffer)), az_buffer
+        )
+        self.imu_values_label.setText(format_imu_reading(imu_reading))
+        sample_count = max(len(ax_buffer), len(ay_buffer), len(az_buffer))
         if sample_count:
             self.acceleration_plot.setXRange(0, sample_count, padding=0)
 

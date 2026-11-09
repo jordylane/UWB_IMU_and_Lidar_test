@@ -26,6 +26,11 @@ HAT. It records incoming sensor data under `pi/`, but does not replay those
 recordings. Use `--lidar-port` or `--data-dir` on `pi_launch.py` to override
 the LiDAR serial device or recording directory.
 
+The Sense HAT IMU telemetry includes raw accelerometer X/Y/Z (g), gyroscope
+X/Y/Z (rad/s), and magnetometer X/Y/Z (uT), plus the HAT's roll, pitch, and
+yaw orientation (rad). The PC dashboard displays each axis and plots all
+three accelerometer axes.
+
 Before starting the Pi software:
 
 1. In `sudo raspi-config`, open **Interface Options > Serial Port**, disable
