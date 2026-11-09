@@ -14,6 +14,24 @@ The launcher opens separate terminal windows for
 for UDP control packets on `0.0.0.0:5007` by default; override this with its
 `--host` and `--port` options when running it directly.
 
+The sensor process reads the lidar live from `/dev/serial0` at 230400 baud by
+default and records the received bytes in `pi/lidar_capture.bin`. UWB and IMU
+remain in their existing playback mode unless live mode is enabled in
+`pi/pi_sensors.py`. To replay a lidar capture instead, run
+`python pi/pi_sensors.py --replay-lidar`. Use `--lidar-port` to select a
+different serial device.
+
+Before starting the Pi software:
+
+1. In `sudo raspi-config`, open **Interface Options > Serial Port**, disable
+   the serial login shell, enable the serial hardware, and reboot.
+2. Ensure the Pi user can access serial devices. If needed, run
+   `sudo usermod -aG dialout "$USER"` and log out and back in.
+3. Connect the lidar's UART TX to Pi pin 10 (GPIO15/RXD), UART RX to Pi pin 8
+   (GPIO14/TXD) if the lidar needs a return channel, and connect ground to
+   ground. Use 3.3 V UART logic; do not apply 5 V logic to the Pi GPIO pins.
+4. Confirm `/dev/serial0` exists, then run `python pi_launch.py`.
+
 ## Windows PC
 
 ```powershell

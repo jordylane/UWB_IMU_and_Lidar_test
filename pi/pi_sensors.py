@@ -39,6 +39,7 @@ from kalman import (
 )
 
 USE_LIVE_DATA = False
+USE_LIVE_LIDAR = True
 PRINT_EVERY = 10
 MAX_SIMULATION_DT = 0.1
 
@@ -674,7 +675,7 @@ def trilaterate_3d(anchors, distances):
 # Lidar System Constants
 # ----------------------------------------------------------------------
 # Serial port of the LIDAR unit
-SERIAL_PORT = "/dev/ttyAMA0"
+SERIAL_PORT = "/dev/serial0"
 
 # At the default rotation speed (~3600 deg/s) the system outputs about 
 # 480 measurements in a full rotation. We want to plot at least this
@@ -780,7 +781,7 @@ def lidar_loop():
 # Choose source
 # --------------------------------------------------
 
-    if USE_LIVE_DATA:
+    if USE_LIVE_LIDAR:
         source = SerialLidarSource(
             SERIAL_PORT, record_filename=DATA_DIR / "lidar_capture.bin"
         )
@@ -1327,27 +1328,44 @@ def sender_loop(pc_ip, control_receiver=None, vehicle=None):
 # --------------------------------------------------
 
 def main():
-    global running, DATA_DIR
+    global running, DATA_DIR, SERIAL_PORT, USE_LIVE_LIDAR
 
     parser = argparse.ArgumentParser(description="Send UWB, IMU, and lidar data over UDP")
     parser.add_argument("--pc-ip", default=PC_IP, help="IP address of the PC display")
+    parser.add_argument(
+        "--lidar-port",
+        default=SERIAL_PORT,
+        help="serial device used by the live lidar (default: /dev/serial0)",
+    )
+    parser.add_argument(
+        "--replay-lidar",
+        action="store_false",
+        dest="use_live_lidar",
+        help="read lidar_capture.bin instead of the live serial lidar",
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
         default=DATA_DIR,
         help=f"directory containing sensor data files (default: {DATA_DIR})",
     )
+    parser.set_defaults(use_live_lidar=USE_LIVE_LIDAR)
     args = parser.parse_args()
     DATA_DIR = args.data_dir.expanduser().resolve()
+    SERIAL_PORT = args.lidar_port
+    USE_LIVE_LIDAR = args.use_live_lidar
     print(f"Sensor data directory: {DATA_DIR}", flush=True)
+    if USE_LIVE_LIDAR:
+        print(f"Reading live lidar from {SERIAL_PORT} at 230400 baud", flush=True)
 
     if not USE_LIVE_DATA:
         required_files = (
-            "lidar_capture.bin",
             "uwb_capture.txt",
             "accelerometer_capture.csv",
             "attitude_capture.csv",
         )
+        if not USE_LIVE_LIDAR:
+            required_files += ("lidar_capture.bin",)
         for filename in required_files:
             path = DATA_DIR / filename
             if not path.is_file():
