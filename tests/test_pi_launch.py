@@ -1,75 +1,109 @@
-import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import pi_launch
 
 
+class FakeProcess:
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+        self.pid = 1
+        self.terminated = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
 class PiLauncherTests(unittest.TestCase):
-    @patch("pi_launch.subprocess.Popen")
-    @patch("pi_launch.shutil.which", return_value="/usr/bin/lxterminal")
-    def test_launches_both_scripts_in_separate_titled_windows(
-        self, _which, popen
-    ):
-        with patch.dict(os.environ, {"DISPLAY": ":0"}):
-            result = pi_launch.main()
+    def test_runs_sensor_and_monitor_in_one_session_with_pc_ip(self):
+        monitor = FakeProcess(returncode=0)
+        sensors = FakeProcess()
+        with patch(
+            "pi_launch.subprocess.Popen",
+            side_effect=(monitor, sensors),
+        ) as popen:
+            result = pi_launch.main([
+                "--pc-ip",
+                "192.0.2.14",
+                "--lidar-port",
+                "/dev/ttyUSB1",
+                "--data-dir",
+                "captures",
+            ])
 
         self.assertEqual(result, 0)
         self.assertEqual(popen.call_count, 2)
         self.assertEqual(
             popen.call_args_list[0].args[0],
-            pi_launch.terminal_command(
-                "lxterminal",
-                "Pi Sensors",
-                pi_launch.ROOT / "pi" / "pi_sensors.py",
-            ),
+            [
+                pi_launch.sys.executable,
+                "-u",
+                str(pi_launch.CONTROL_MONITOR_SCRIPT),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "5007",
+            ],
         )
         self.assertEqual(
             popen.call_args_list[1].args[0],
-            pi_launch.terminal_command(
-                "lxterminal",
-                "Pi Control Monitor",
-                pi_launch.ROOT / "pi" / "pi_control_monitor.py",
-                ("--host", "0.0.0.0", "--port", "5007"),
-            ),
+            [
+                pi_launch.sys.executable,
+                "-u",
+                str(pi_launch.SENSOR_SCRIPT),
+                "--pc-ip",
+                "192.0.2.14",
+                "--lidar-port",
+                "/dev/ttyUSB1",
+                "--data-dir",
+                str(Path("captures").resolve()),
+            ],
         )
         for call in popen.call_args_list:
             self.assertEqual(call.kwargs["cwd"], pi_launch.ROOT)
-            self.assertIn(pi_launch.sys.executable, call.args[0][-1])
+        self.assertTrue(sensors.terminated)
 
-    @patch("pi_launch.subprocess.Popen")
-    @patch("pi_launch.shutil.which", return_value=None)
-    def test_reports_missing_terminal_emulator(self, _which, popen):
-        with patch.dict(os.environ, {"DISPLAY": ":0"}):
-            with patch("builtins.print") as print_output:
-                result = pi_launch.main()
+    def test_stops_started_process_if_another_child_cannot_start(self):
+        monitor = FakeProcess()
+        with patch(
+            "pi_launch.subprocess.Popen",
+            side_effect=(monitor, OSError("launch failed")),
+        ):
+            result = pi_launch.main(["--pc-ip", "192.0.2.14"])
+
+        self.assertEqual(result, 1)
+        self.assertTrue(monitor.terminated)
+
+    def test_reports_missing_child_script(self):
+        with (
+            patch.object(
+                pi_launch,
+                "CONTROL_MONITOR_SCRIPT",
+                Path("monitor.py"),
+            ),
+            patch.object(
+                pi_launch,
+                "SENSOR_SCRIPT",
+                Path("sensors.py"),
+            ),
+            patch("pathlib.Path.is_file", side_effect=(True, False)),
+            patch("pi_launch.subprocess.Popen") as popen,
+        ):
+            result = pi_launch.main(["--pc-ip", "192.0.2.14"])
 
         self.assertEqual(result, 1)
         popen.assert_not_called()
-        self.assertIn("none of", str(print_output.call_args))
-
-    @patch("pi_launch.subprocess.Popen")
-    @patch("pi_launch.shutil.which")
-    def test_reports_missing_display(self, which, popen):
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("builtins.print") as print_output:
-                result = pi_launch.main()
-
-        self.assertEqual(result, 1)
-        which.assert_not_called()
-        popen.assert_not_called()
-        self.assertIn("DISPLAY is not set", str(print_output.call_args))
-
-    def test_terminal_command_variants_keep_failed_script_window_open(self):
-        script = pi_launch.ROOT / "pi" / "pi_sensors.py"
-        for terminal in pi_launch.TERMINALS:
-            with self.subTest(terminal=terminal):
-                command = pi_launch.terminal_command(
-                    terminal, "Pi Sensors", script
-                )
-                self.assertIn("Pi Sensors", command)
-                self.assertIn(pi_launch.sys.executable, " ".join(command))
-                self.assertIn("Press Enter to close", " ".join(command))
 
 
 if __name__ == "__main__":
