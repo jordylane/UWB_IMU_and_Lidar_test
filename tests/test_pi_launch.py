@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -33,14 +34,15 @@ class PiLauncherTests(unittest.TestCase):
             "pi_launch.subprocess.Popen",
             side_effect=(monitor, sensors),
         ) as popen:
-            result = pi_launch.main([
-                "--pc-ip",
-                "192.0.2.14",
-                "--lidar-port",
-                "/dev/ttyUSB1",
-                "--data-dir",
-                "captures",
-            ])
+            with patch.dict(os.environ, {}, clear=True):
+                result = pi_launch.main([
+                    "--pc-ip",
+                    "192.0.2.14",
+                    "--lidar-port",
+                    "/dev/ttyUSB1",
+                    "--data-dir",
+                    "captures",
+                ])
 
         self.assertEqual(result, 0)
         self.assertEqual(popen.call_count, 2)
