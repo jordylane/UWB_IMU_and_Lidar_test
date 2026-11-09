@@ -1477,13 +1477,12 @@ lidar_thread.start()
 uwb_thread.start()
 acc_thread.start()
 att_thread.start()
-display_thread.start()
+# display_thread.start()
 control_thread.start()
 
 
 try:
-    while True:
-        time.sleep(1)
+    display_loop()
 
 except KeyboardInterrupt:
 
@@ -1493,7 +1492,6 @@ except KeyboardInterrupt:
     att_thread.join()
     uwb_thread.join()
     lidar_thread.join()
-    display_thread.join()
 
     
     print("Stopped")

@@ -8,6 +8,7 @@ import time
 import traceback
 from collections import deque
 from pathlib import Path
+from urllib.request import urlopen
 
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
@@ -19,8 +20,17 @@ try:
 except ImportError:
     pygame = None
 
-from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QSize, QTimer
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QRect,
+    Qt,
+    QSize,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -38,6 +48,7 @@ from PySide6.QtWidgets import (
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+from pc.mjpeg import extract_jpeg_frames
 from common import (
     COMMAND_TIMEOUT_S,
     CONTROL_PORT,
@@ -54,6 +65,7 @@ from pc.controller_input import controller_commands
 from pc.control_connection import ControlHandshake
 
 DEFAULT_PI_IP = PI_IP
+CAMERA_STREAM_URL = "http://192.168.137.115:5000"
 PRINT_EVERY = 10
 PLOT_SPAN = 5.0
 HISTORY_LENGTH = 100
@@ -651,24 +663,120 @@ class UwbPlot(SquarePlotWidget):
             self.current_position.setData([], [])
 
 
-class CameraPlaceholder(QFrame):
+class CameraStream(QObject):
+    frame_ready = Signal(QImage)
+    status_changed = Signal(str)
+
+    def __init__(self, base_url=CAMERA_STREAM_URL):
+        super().__init__()
+        self.base_url = base_url.rstrip("/")
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run,
+            name="camera-stream",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+
+    def _open_stream(self):
+        errors = []
+        for path in ("/video_feed", "/"):
+            try:
+                response = urlopen(self.base_url + path, timeout=2)
+            except OSError as error:
+                errors.append(f"{path}: {error}")
+                continue
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" in content_type.lower():
+                response.close()
+                errors.append(f"{path}: returned an HTML page")
+                continue
+            return response
+        raise OSError("; ".join(errors))
+
+    def _read_stream(self, response):
+        buffer = bytearray()
+        while not self._stop_event.is_set():
+            chunk = response.read1(4096)
+            if not chunk:
+                return
+            buffer.extend(chunk)
+            for encoded_frame in extract_jpeg_frames(buffer):
+                image = QImage.fromData(encoded_frame)
+                if not image.isNull():
+                    self.frame_ready.emit(image)
+
+            if len(buffer) > 8 * 1024 * 1024:
+                buffer.clear()
+
+    def _run(self):
+        self.status_changed.emit("Connecting to camera...")
+        while not self._stop_event.is_set():
+            try:
+                with self._open_stream() as response:
+                    self.status_changed.emit("Camera connected; waiting for frames...")
+                    self._read_stream(response)
+                    if not self._stop_event.is_set():
+                        raise OSError("camera stream ended")
+            except OSError as error:
+                if self._stop_event.is_set():
+                    break
+                self.status_changed.emit(
+                    f"Camera unavailable: {error}. Retrying..."
+                )
+                self._stop_event.wait(1)
+
+
+class CameraView(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("cameraPanel")
+        self.setObjectName("cameraView")
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        label = QLabel("Camera feed")
-        label.setObjectName("cameraText")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(label)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(True)
+        self._frame = None
+        self.setText("Connecting to camera...")
 
     def sizeHint(self):
         return QSize(300, 300)
+
+    def set_frame(self, image):
+        if image.isNull():
+            return
+        self._frame = QPixmap.fromImage(image)
+        self.setText("")
+        self._update_frame()
+
+    def set_status(self, message):
+        self._frame = None
+        self.setPixmap(QPixmap())
+        self.setText(message)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_frame()
+
+    def _update_frame(self):
+        if self._frame is not None:
+            self.setPixmap(
+                self._frame.scaled(
+                    self.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
 
 
 class StaleOverlay(QWidget):
@@ -846,6 +954,10 @@ class MainWindow(QMainWindow):
         )
 
         self._build_ui()
+        self.camera_stream = CameraStream()
+        self.camera_stream.frame_ready.connect(self.set_camera_frame)
+        self.camera_stream.status_changed.connect(self.camera_view.set_status)
+        self.camera_stream.start()
         QApplication.instance().installEventFilter(self)
         self._init_controller()
         self.link_details = LinkDetailsDialog(self)
@@ -1057,8 +1169,8 @@ class MainWindow(QMainWindow):
         camera_title = QLabel("Camera")
         camera_title.setObjectName("panelTitle")
         camera_layout.addWidget(camera_title)
-        self.camera_placeholder = CameraPlaceholder()
-        camera_layout.addWidget(self.camera_placeholder, 1)
+        self.camera_view = CameraView()
+        camera_layout.addWidget(self.camera_view, 1)
         bottom_layout.addWidget(camera_panel, 1)
         root.addWidget(bottom_section, 1)
         self.setCentralWidget(central)
@@ -1513,7 +1625,7 @@ class MainWindow(QMainWindow):
             self.sender_label.style().polish(self.sender_label)
 
     def set_camera_frame(self, qimage):
-        pass
+        self.camera_view.set_frame(qimage)
 
     def keyPressEvent(self, event):
         if self._handle_control_key_press(event):
@@ -1595,6 +1707,7 @@ class MainWindow(QMainWindow):
         self.stop_event.set()
         self.update_timer.stop()
         self.control_timer.stop()
+        self.camera_stream.stop()
         self.receiver_socket.close()
         self.control_socket.close()
         self.receiver.join()
@@ -1687,12 +1800,13 @@ def main():
             border-color: {RED};
             color: white;
         }}
-        QFrame#cameraPanel {{
-            background: {PANEL};
-            border: 2px dashed {BORDER};
-            border-radius: 8px;
+        QLabel#cameraView {{
+            background: #121315;
+            border-radius: 6px;
+            color: {MUTED};
+            font-size: 14px;
+            padding: 8px;
         }}
-        QLabel#cameraText {{ color: {MUTED}; font-size: 16px; }}
         QStatusBar {{
             background: {PANEL};
             border-top: 1px solid {BORDER};
